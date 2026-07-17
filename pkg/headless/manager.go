@@ -10,25 +10,28 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 )
 
 // Instance represents the single headless OpenCode instance
 type Instance struct {
-	Port   int    `json:"port"`
-	PID    int    `json:"pid"`
-	Status string `json:"status"`
-	cmd    *exec.Cmd
+	Port     int    `json:"port"`
+	PID      int    `json:"pid"`
+	Status   string `json:"status"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	cmd      *exec.Cmd
 }
 
 // Session represents a session for a specific project
 type Session struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Path      string `json:"path"`
-	Agent     string `json:"agent"`
-	Status    string `json:"status"`
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Agent  string `json:"agent"`
+	Status string `json:"status"`
 }
 
 // Manager manages the headless OpenCode instance and sessions
@@ -76,7 +79,6 @@ func (m *Manager) Start(port int) error {
 		return fmt.Errorf("instance already running")
 	}
 
-	// Find available port if requested port is in use
 	if !IsPortAvailable(port) {
 		availablePort, err := FindAvailablePort(port + 1)
 		if err != nil {
@@ -86,20 +88,16 @@ func (m *Manager) Start(port int) error {
 		port = availablePort
 	}
 
-	// Find opencode binary
 	opencodePath, err := exec.LookPath("opencode")
 	if err != nil {
 		return fmt.Errorf("opencode not found in PATH: %w", err)
 	}
 
-	// Start OpenCode in headless server mode
 	cmd := exec.Command(opencodePath, "serve",
 		"--port", fmt.Sprintf("%d", port),
 		"--hostname", "127.0.0.1",
 	)
-	cmd.Env = append(os.Environ(),
-		fmt.Sprintf("OPENCODE_PORT=%d", port),
-	)
+	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -114,30 +112,34 @@ func (m *Manager) Start(port int) error {
 		cmd:    cmd,
 	}
 
-	// Wait for ready
 	go m.waitForReady()
-
-	// Monitor
 	go m.monitor()
 
 	return nil
 }
 
-// waitForReady waits for the instance to be healthy
 func (m *Manager) waitForReady() {
-	client := &http.Client{Timeout: 1 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", m.instance.Port)
+	client := &http.Client{Timeout: 2 * time.Second}
 
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
 
-		resp, err := client.Get(url)
-		if err == nil && resp.StatusCode == 200 {
-			m.mu.Lock()
-			m.instance.Status = "running"
-			m.mu.Unlock()
-			log.Printf("✓ OpenCode ready on port %d", m.instance.Port)
-			return
+		// Try to access the API - no auth needed for health check
+		// Just check if the server is responding
+		url := fmt.Sprintf("http://127.0.0.1:%d/session", m.instance.Port)
+		req, _ := http.NewRequest("GET", url, nil)
+
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 200 || resp.StatusCode == 401 {
+				// Server is up (401 means auth is required but server is running)
+				m.mu.Lock()
+				m.instance.Status = "running"
+				m.mu.Unlock()
+				log.Printf("✓ OpenCode ready on port %d", m.instance.Port)
+				return
+			}
 		}
 	}
 
@@ -147,7 +149,6 @@ func (m *Manager) waitForReady() {
 	log.Printf("✗ OpenCode failed to start")
 }
 
-// monitor watches for crashes
 func (m *Manager) monitor() {
 	err := m.instance.cmd.Wait()
 
@@ -219,31 +220,101 @@ func (m *Manager) IsRunning() bool {
 	return m.instance != nil && m.instance.Status == "running"
 }
 
-// CreateSession creates a new session for a project
+// CreateSession creates a new session using opencode run
 func (m *Manager) CreateSession(name, path, agent string) (*Session, error) {
 	m.mu.RLock()
-	port := 0
-	if m.instance != nil {
-		port = m.instance.Port
-	}
+	inst := m.instance
 	m.mu.RUnlock()
 
-	if port == 0 {
+	if inst == nil || inst.Status != "running" {
 		return nil, fmt.Errorf("no instance running")
 	}
 
-	// Create session via OpenCode API
-	url := fmt.Sprintf("http://127.0.0.1:%d/session.create", port)
+	// Use opencode CLI to create session (handles auth automatically)
+	opencodePath, err := exec.LookPath("opencode")
+	if err != nil {
+		return nil, err
+	}
+
+	// Run a simple command to create a session
+	cmd := exec.Command(opencodePath, "run",
+		"--attach", fmt.Sprintf("http://127.0.0.1:%d", inst.Port),
+		"--title", fmt.Sprintf("%s - %s", name, agent),
+		"--format", "json",
+		"--agent", agent,
+		"echo initializing",
+	)
+	cmd.Dir = path
+	cmd.Env = os.Environ()
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("CreateSession output: %s", string(output))
+		// Try alternative approach - direct API call
+		return m.createSessionViaAPI(name, path, agent)
+	}
+
+	// Parse session ID from output
+	sessionID := parseSessionID(string(output))
+	if sessionID == "" {
+		return m.createSessionViaAPI(name, path, agent)
+	}
+
+	session := &Session{
+		ID:     sessionID,
+		Name:   name,
+		Path:   path,
+		Agent:  agent,
+		Status: "active",
+	}
+
+	m.mu.Lock()
+	m.sessions[name] = session
+	m.mu.Unlock()
+
+	log.Printf("✓ Session created for %s (ID: %s)", name, sessionID)
+
+	return session, nil
+}
+
+// createSessionViaAPI creates a session via direct API call
+func (m *Manager) createSessionViaAPI(name, path, agent string) (*Session, error) {
+	m.mu.RLock()
+	inst := m.instance
+	m.mu.RUnlock()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/session", inst.Port)
 
 	body, _ := json.Marshal(map[string]interface{}{
 		"title": fmt.Sprintf("%s - %s", name, agent),
 	})
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	req, _ := http.NewRequest("POST", url, bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	// Try without auth first (if OPENCODE_SERVER_PASSWORD not set)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		// Need auth - get credentials from environment
+		username := os.Getenv("OPENCODE_SERVER_USERNAME")
+		password := os.Getenv("OPENCODE_SERVER_PASSWORD")
+
+		if username == "" || password == "" {
+			return nil, fmt.Errorf("OpenCode requires auth. Set OPENCODE_SERVER_USERNAME and OPENCODE_SERVER_PASSWORD environment variables")
+		}
+
+		req.SetBasicAuth(username, password)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+	}
 
 	if resp.StatusCode != 200 {
 		respBody, _ := io.ReadAll(resp.Body)
@@ -269,8 +340,6 @@ func (m *Manager) CreateSession(name, path, agent string) (*Session, error) {
 	m.sessions[name] = session
 	m.mu.Unlock()
 
-	log.Printf("✓ Session created for %s (ID: %s)", name, result.ID)
-
 	return session, nil
 }
 
@@ -295,54 +364,167 @@ func (m *Manager) ListSessions() []*Session {
 	return sessions
 }
 
-// SendPrompt sends a prompt to a session
+// SendPrompt sends a prompt to a session using opencode run
 func (m *Manager) SendPrompt(sessionName, prompt string) (string, error) {
 	m.mu.RLock()
 	session, ok := m.sessions[sessionName]
-	port := 0
-	if m.instance != nil {
-		port = m.instance.Port
-	}
+	inst := m.instance
 	m.mu.RUnlock()
 
 	if !ok {
 		return "", fmt.Errorf("session not found: %s", sessionName)
 	}
 
-	if port == 0 {
+	if inst == nil || inst.Status != "running" {
 		return "", fmt.Errorf("no instance running")
 	}
 
-	url := fmt.Sprintf("http://127.0.0.1:%d/session.prompt", port)
-
-	body, _ := json.Marshal(map[string]interface{}{
-		"sessionID": session.ID,
-		"parts": []map[string]string{
-			{"type": "text", "text": prompt},
-		},
-	})
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	// Use opencode CLI to send prompt (handles auth automatically)
+	opencodePath, err := exec.LookPath("opencode")
 	if err != nil {
-		return "", fmt.Errorf("failed to send prompt: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+		return "", err
 	}
 
-	var result struct {
-		Content string `json:"content"`
-		Text    string `json:"text"`
+	cmd := exec.Command(opencodePath, "run",
+		"--attach", fmt.Sprintf("http://127.0.0.1:%d", inst.Port),
+		"--session", session.ID,
+		"--format", "json",
+		prompt,
+	)
+	cmd.Dir = session.Path
+	cmd.Env = os.Environ()
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to send prompt: %w\nOutput: %s", err, string(output))
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+
+	// Parse response from output
+	response := parseResponse(string(output))
+	if response == "" {
 		return "Message sent", nil
 	}
 
-	if result.Content != "" {
-		return result.Content, nil
+	return response, nil
+}
+
+// GetMessages gets messages from a session
+func (m *Manager) GetMessages(sessionName string) ([]string, error) {
+	m.mu.RLock()
+	session, ok := m.sessions[sessionName]
+	inst := m.instance
+	m.mu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("session not found: %s", sessionName)
 	}
-	return result.Text, nil
+
+	if inst == nil || inst.Status != "running" {
+		return nil, fmt.Errorf("no instance running")
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/session/%s/message", inst.Port, session.ID)
+
+	req, _ := http.NewRequest("GET", url, nil)
+
+	// Try without auth first
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		username := os.Getenv("OPENCODE_SERVER_USERNAME")
+		password := os.Getenv("OPENCODE_SERVER_PASSWORD")
+		if username != "" && password != "" {
+			req.SetBasicAuth(username, password)
+			resp, err = http.DefaultClient.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+		}
+	}
+
+	var messages []struct {
+		Info struct {
+			Role string `json:"role"`
+		} `json:"info"`
+		Parts []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"parts"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&messages); err != nil {
+		return nil, err
+	}
+
+	var result []string
+	for _, msg := range messages {
+		for _, part := range msg.Parts {
+			if part.Type == "text" && part.Text != "" {
+				result = append(result, part.Text)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// parseSessionID extracts session ID from opencode run output
+func parseSessionID(output string) string {
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		// Look for session ID pattern
+		if strings.Contains(line, "ses_") {
+			parts := strings.Fields(line)
+			for _, part := range parts {
+				if strings.HasPrefix(part, "ses_") {
+					return strings.Trim(part, "\"',.")
+				}
+			}
+		}
+		// Look for JSON with id field
+		if strings.Contains(line, "\"id\"") && strings.Contains(line, "ses_") {
+			var obj struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal([]byte(line), &obj); err == nil {
+				return obj.ID
+			}
+		}
+	}
+	return ""
+}
+
+// parseResponse extracts response text from opencode run output
+func parseResponse(output string) string {
+	lines := strings.Split(output, "\n")
+	var responseLines []string
+	inResponse := false
+
+	for _, line := range lines {
+		// Look for assistant response markers
+		if strings.Contains(line, "\"role\":\"assistant\"") || strings.Contains(line, "\"role\": \"assistant\"") {
+			inResponse = true
+			continue
+		}
+		if inResponse && strings.Contains(line, "\"text\"") {
+			// Extract text content
+			parts := strings.SplitN(line, "\"text\":", 2)
+			if len(parts) > 1 {
+				text := strings.TrimSpace(parts[1])
+				text = strings.Trim(text, "\"")
+				text = strings.TrimSuffix(text, "\"")
+				responseLines = append(responseLines, text)
+			}
+		}
+	}
+
+	if len(responseLines) > 0 {
+		return strings.Join(responseLines, "\n")
+	}
+	return ""
 }
