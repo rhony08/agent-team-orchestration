@@ -66,6 +66,8 @@ Workflow:
 	rootCmd.AddCommand(taskCmd())
 	rootCmd.AddCommand(checkpointCmd())
 	rootCmd.AddCommand(projectCmd())
+	rootCmd.AddCommand(instancesCmd())
+	rootCmd.AddCommand(logsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -678,6 +680,195 @@ func projectCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(listCmd)
+	return cmd
+}
+
+func instancesCmd() *cobra.Command {
+	var projectName string
+
+	cmd := &cobra.Command{
+		Use:   "instances",
+		Short: "Show detailed instance information",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
+			config, _ := loadConfig(stateDir)
+			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
+
+			client := &http.Client{Timeout: 2 * time.Second}
+
+			fmt.Printf("Project: %s\n\n", config.Project)
+			fmt.Printf("%-20s %-10s %-8s %-30s\n", "INSTANCE", "STATUS", "PORT", "MODEL")
+			fmt.Printf("%-20s %-10s %-8s %-30s\n", "────────", "──────", "────", "─────")
+
+			for _, repo := range config.Repos {
+				status := "stopped"
+				model := "unknown"
+
+				// Check health
+				healthURL := fmt.Sprintf("http://127.0.0.1:%d/health", repo.Port)
+				resp, err := client.Get(healthURL)
+				if err == nil && resp.StatusCode == 200 {
+					status = "running"
+					resp.Body.Close()
+
+					// Get model info via OpenCode API
+					modelURL := fmt.Sprintf("http://127.0.0.1:%d/config.get", repo.Port)
+					req, _ := http.NewRequest("GET", modelURL, nil)
+					req.Header.Set("Authorization", "Bearer "+string(secret))
+
+					modelResp, err := client.Do(req)
+					if err == nil && modelResp.StatusCode == 200 {
+						var configResp struct {
+							Model string `json:"model"`
+						}
+						json.NewDecoder(modelResp.Body).Decode(&configResp)
+						if configResp.Model != "" {
+							model = configResp.Model
+						}
+						modelResp.Body.Close()
+					}
+				}
+
+				fmt.Printf("%-20s %-10s %-8d %-30s\n", repo.Name, status, repo.Port, model)
+			}
+
+			// Show tasks summary
+			fmt.Printf("\n─── Tasks ───\n")
+			tasksURL := fmt.Sprintf("http://localhost:%d/api/v1/tasks", config.Port)
+			req, _ := http.NewRequest("GET", tasksURL, nil)
+			req.Header.Set("Authorization", "Bearer "+string(secret))
+
+			resp, err := client.Do(req)
+			if err == nil {
+				var tasks []struct {
+					ID       string `json:"id"`
+					Title    string `json:"title"`
+					Status   string `json:"status"`
+					Assignee string `json:"assignee"`
+				}
+				json.NewDecoder(resp.Body).Decode(&tasks)
+				resp.Body.Close()
+
+				if len(tasks) == 0 {
+					fmt.Println("  No tasks yet.")
+				} else {
+					for _, t := range tasks {
+						fmt.Printf("  [%s] %s (%s) → %s\n", t.ID[:8], t.Title, t.Status, t.Assignee)
+					}
+				}
+			}
+
+			// Show checkpoints
+			fmt.Printf("\n─── Checkpoints ───\n")
+			cpURL := fmt.Sprintf("http://localhost:%d/api/v1/checkpoints", config.Port)
+			req, _ = http.NewRequest("GET", cpURL, nil)
+			req.Header.Set("Authorization", "Bearer "+string(secret))
+
+			resp, err = client.Do(req)
+			if err == nil {
+				var cps []struct {
+					ID          string `json:"id"`
+					Description string `json:"description"`
+					Status      string `json:"status"`
+					Requester   string `json:"requester"`
+				}
+				json.NewDecoder(resp.Body).Decode(&cps)
+				resp.Body.Close()
+
+				if len(cps) == 0 {
+					fmt.Println("  No pending checkpoints.")
+				} else {
+					for _, cp := range cps {
+						fmt.Printf("  [%s] %s (from: %s) - %s\n", cp.ID[:8], cp.Description, cp.Requester, cp.Status)
+					}
+				}
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
+}
+
+func logsCmd() *cobra.Command {
+	var projectName string
+	var instanceName string
+	var follow bool
+
+	cmd := &cobra.Command{
+		Use:   "logs",
+		Short: "Show instance logs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
+			config, _ := loadConfig(stateDir)
+
+			if instanceName != "" {
+				// Show logs for specific instance
+				var port int
+				for _, repo := range config.Repos {
+					if repo.Name == instanceName {
+						port = repo.Port
+						break
+					}
+				}
+				if port == 0 {
+					return fmt.Errorf("instance not found: %s", instanceName)
+				}
+
+				fmt.Printf("Logs for %s (port %d):\n", instanceName, port)
+
+				// Query OpenCode sessions
+				url := fmt.Sprintf("http://127.0.0.1:%d/session.list", port)
+				resp, err := http.Get(url)
+				if err != nil {
+					return fmt.Errorf("instance not responding")
+				}
+				defer resp.Body.Close()
+
+				var sessions []struct {
+					ID    string `json:"id"`
+					Title string `json:"title"`
+				}
+				json.NewDecoder(resp.Body).Decode(&sessions)
+
+				fmt.Printf("\nActive sessions:\n")
+				for _, s := range sessions {
+					fmt.Printf("  • %s: %s\n", s.ID, s.Title)
+				}
+			} else {
+				// Show all instances
+				fmt.Printf("Available instances:\n")
+				for _, repo := range config.Repos {
+					status := "stopped"
+					client := &http.Client{Timeout: 1 * time.Second}
+					resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", repo.Port))
+					if err == nil && resp.StatusCode == 200 {
+						status = "running"
+						resp.Body.Close()
+					}
+					fmt.Printf("  • %s (port %d) - %s\n", repo.Name, repo.Port, status)
+				}
+				fmt.Printf("\nUse: crush-orchestrator logs --instance <name>\n")
+			}
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	cmd.Flags().StringVarP(&instanceName, "instance", "i", "", "Instance name")
+	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow logs (not implemented)")
+
 	return cmd
 }
 
