@@ -52,10 +52,9 @@ Runs OpenCode instances in headless mode and coordinates them through
 a central daemon. Users interact via CLI commands.
 
 Workflow:
-  1. crush-orchestrator init my-project --repos ./repo1,./repo2
-  2. crush-orchestrator start
-  3. crush-orchestrator task create --title "Implement auth" --repo repo1
-  4. crush-orchestrator send repo1 "implement JWT authentication"`,
+  crush-orchestrator init my-project --repos ./repo1,./repo2
+  crush-orchestrator start
+  crush-orchestrator send repo1 "implement JWT authentication"`,
 		Version: fmt.Sprintf("%s (commit: %s)", version, commit),
 	}
 
@@ -66,6 +65,7 @@ Workflow:
 	rootCmd.AddCommand(sendCmd())
 	rootCmd.AddCommand(taskCmd())
 	rootCmd.AddCommand(checkpointCmd())
+	rootCmd.AddCommand(projectCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -81,12 +81,7 @@ func initCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init [project-name]",
 		Short: "Initialize orchestration workspace",
-		Long: `Initialize a new orchestration workspace.
-
-Projects can be local paths or remote git URLs:
-  --repos ./repo1,./repo2
-  --repos git@github.com:org/repo.git,./local-project`,
-		Args: cobra.ExactArgs(1),
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projectName := args[0]
 			stateDir := ".orchestrator"
@@ -154,7 +149,6 @@ Projects can be local paths or remote git URLs:
 				CreatedAt:  time.Now().Format(time.RFC3339),
 			}
 
-			// Create state directory
 			dirs := []string{
 				"tasks/active", "tasks/completed",
 				"messages/inbox", "messages/archive",
@@ -170,7 +164,9 @@ Projects can be local paths or remote git URLs:
 			os.WriteFile(filepath.Join(stateDir, "config.json"), configData, 0644)
 			os.WriteFile(filepath.Join(stateDir, "auth.key"), []byte(secret), 0600)
 
-			// Setup .opencode in each repo
+			// Register in global projects list
+			registerProject(projectName, stateDir)
+
 			for _, repo := range repoConfigs {
 				setupRepoConfig(repo.Path, secret, config.Port)
 			}
@@ -199,39 +195,46 @@ Projects can be local paths or remote git URLs:
 
 func startCmd() *cobra.Command {
 	var port int
+	var projectName string
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start orchestration daemon and headless OpenCode instances",
-		Long: `Starts the orchestration daemon and spawns OpenCode instances
-in headless mode for each configured project.
-
-Each OpenCode instance runs as a background server (no TUI).
-The daemon coordinates all instances and handles checkpoints.`,
+		Short: "Start orchestration daemon and headless instances",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := ".orchestrator"
+			// Find project to start
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
 
 			config, err := loadConfig(stateDir)
 			if err != nil {
-				return fmt.Errorf("run 'crush-orchestrator init' first: %w", err)
+				return fmt.Errorf("failed to load config: %w", err)
 			}
 
 			secretBytes, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 			secret := string(secretBytes)
 
-			// Start state manager
+			// Use config port if not overridden
+			if port == 9800 && config.Port != 0 {
+				port = config.Port
+			}
+
+			// Check if daemon port is available
+			if !headless.IsPortAvailable(port) {
+				return fmt.Errorf("port %d is already in use. Is the daemon already running?", port)
+			}
+
 			stateManager, err := state.NewManager(stateDir)
 			if err != nil {
 				return err
 			}
 
-			// Start daemon
 			d := daemon.New(stateManager, port, secret)
 			if err := d.Start(); err != nil {
 				return err
 			}
 
-			// Start headless OpenCode instances
 			hm := headless.NewManager(9801)
 
 			fmt.Printf("╔══════════════════════════════════════════════════╗\n")
@@ -243,39 +246,39 @@ The daemon coordinates all instances and handles checkpoints.`,
 			fmt.Printf("║  Starting headless instances...\n")
 
 			for _, repo := range config.Repos {
-				fmt.Printf("║    Starting %s on port %d...\n", repo.Name, repo.Port)
+				fmt.Printf("║    Starting %s...\n", repo.Name)
 				if err := hm.Spawn(repo.Name, repo.Path, repo.Port); err != nil {
-					fmt.Printf("║    ✗ Failed: %v\n", err)
+					fmt.Printf("║    ✗ %s: %v\n", repo.Name, err)
 				}
 			}
 
-			// Wait for instances to be ready
 			fmt.Printf("║  Waiting for instances...\n")
 			time.Sleep(5 * time.Second)
 
 			instances := hm.ListInstances()
+			running := 0
 			for _, inst := range instances {
 				symbol := "✓"
 				if inst.Status != "running" {
 					symbol = "✗"
+				} else {
+					running++
 				}
-				fmt.Printf("║    %s %s: %s\n", symbol, inst.Name, inst.Status)
+				fmt.Printf("║    %s %s: %s (port %d)\n", symbol, inst.Name, inst.Status, inst.Port)
 			}
 
 			fmt.Printf("║                                                  \n")
-			fmt.Printf("║  Ready! Use CLI commands to interact:            \n")
-			fmt.Printf("║    crush-orchestrator send <repo> <message>      \n")
-			fmt.Printf("║    crush-orchestrator task create ...            \n")
-			fmt.Printf("║    crush-orchestrator checkpoint list            \n")
+			fmt.Printf("║  %d/%d instances running\n", running, len(instances))
 			fmt.Printf("║                                                  \n")
-			fmt.Printf("║  Checkpoints will appear below.                  \n")
+			fmt.Printf("║  Commands:\n")
+			fmt.Printf("║    crush-orchestrator send <repo> <message>\n")
+			fmt.Printf("║    crush-orchestrator task create ...\n")
+			fmt.Printf("║    crush-orchestrator checkpoint list\n")
 			fmt.Printf("╚══════════════════════════════════════════════════╝\n")
 
-			// Write PID
 			pidFile := filepath.Join(stateDir, "daemon.pid")
 			os.WriteFile(pidFile, []byte(fmt.Sprintf("%d", os.Getpid())), 0644)
 
-			// Wait for signal
 			fmt.Println("\nPress Ctrl+C to stop.")
 			sigCh := make(chan os.Signal, 1)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -292,17 +295,24 @@ The daemon coordinates all instances and handles checkpoints.`,
 	}
 
 	cmd.Flags().IntVarP(&port, "port", "p", 9800, "Daemon port")
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name (default: from current directory)")
+
 	return cmd
 }
 
 func stopCmd() *cobra.Command {
-	return &cobra.Command{
+	var projectName string
+
+	cmd := &cobra.Command{
 		Use:   "stop",
 		Short: "Stop the daemon and all instances",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := ".orchestrator"
-			pidFile := filepath.Join(stateDir, "daemon.pid")
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
 
+			pidFile := filepath.Join(stateDir, "daemon.pid")
 			data, err := os.ReadFile(pidFile)
 			if err != nil {
 				return fmt.Errorf("not running")
@@ -319,14 +329,23 @@ func stopCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
 }
 
 func statusCmd() *cobra.Command {
-	return &cobra.Command{
+	var projectName string
+
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show daemon and instance status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := ".orchestrator"
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
@@ -355,6 +374,7 @@ func statusCmd() *cobra.Command {
 			}
 			json.NewDecoder(resp.Body).Decode(&status)
 
+			fmt.Printf("Project: %s\n", config.Project)
 			fmt.Println("Daemon: running")
 			fmt.Printf("Tasks: %d active, %d completed\n", status.Stats.ActiveTasks, status.Stats.CompletedTasks)
 			fmt.Printf("Checkpoints: %d pending\n", status.Stats.PendingCheckpoints)
@@ -365,37 +385,29 @@ func statusCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
 }
 
 func sendCmd() *cobra.Command {
-	return &cobra.Command{
+	var projectName string
+
+	cmd := &cobra.Command{
 		Use:   "send [instance] [message]",
 		Short: "Send a message to an OpenCode instance",
-		Long: `Send a task or message to a headless OpenCode instance.
-
-Example:
-  crush-orchestrator send api-gateway "implement JWT authentication"
-  crush-orchestrator send user-service "add email verification endpoint"`,
-		Args: cobra.ExactArgs(2),
+		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			instanceName := args[0]
 			message := args[1]
 
-			stateDir := ".orchestrator"
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
-
-			// Find instance port
-			var port int
-			for _, repo := range config.Repos {
-				if repo.Name == instanceName {
-					port = repo.Port
-					break
-				}
-			}
-			if port == 0 {
-				return fmt.Errorf("instance not found: %s", instanceName)
-			}
 
 			// Send via daemon
 			url := fmt.Sprintf("http://localhost:%d/api/v1/send", config.Port)
@@ -428,9 +440,14 @@ Example:
 			return nil
 		},
 	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
 }
 
 func taskCmd() *cobra.Command {
+	var projectName string
+
 	cmd := &cobra.Command{
 		Use:   "task",
 		Short: "Manage tasks",
@@ -445,7 +462,11 @@ func taskCmd() *cobra.Command {
 			assignee, _ := cmd.Flags().GetString("assignee")
 			priority, _ := cmd.Flags().GetString("priority")
 
-			stateDir := ".orchestrator"
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
@@ -490,7 +511,11 @@ func taskCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List tasks",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := ".orchestrator"
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
@@ -525,10 +550,13 @@ func taskCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(createCmd, listCmd)
+	cmd.PersistentFlags().StringVar(&projectName, "project", "", "Project name")
 	return cmd
 }
 
 func checkpointCmd() *cobra.Command {
+	var projectName string
+
 	cmd := &cobra.Command{
 		Use:   "checkpoint",
 		Short: "Manage checkpoints",
@@ -538,7 +566,11 @@ func checkpointCmd() *cobra.Command {
 		Use:   "list",
 		Short: "List pending checkpoints",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir := ".orchestrator"
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
@@ -578,7 +610,7 @@ func checkpointCmd() *cobra.Command {
 		Short: "Approve a checkpoint",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resolveCheckpoint(args[0], "approve", "")
+			return resolveCheckpoint(args[0], "approve", "", projectName)
 		},
 	}
 
@@ -591,16 +623,64 @@ func checkpointCmd() *cobra.Command {
 			if len(args) > 1 {
 				reason = args[1]
 			}
-			return resolveCheckpoint(args[0], "deny", reason)
+			return resolveCheckpoint(args[0], "deny", reason, projectName)
 		},
 	}
 
 	cmd.AddCommand(listCmd, approveCmd, denyCmd)
+	cmd.PersistentFlags().StringVar(&projectName, "project", "", "Project name")
 	return cmd
 }
 
-func resolveCheckpoint(id, action, reason string) error {
-	stateDir := ".orchestrator"
+func projectCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "project",
+		Short: "Manage orchestration projects",
+	}
+
+	listCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List all projects",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			projects := listProjects()
+
+			if len(projects) == 0 {
+				fmt.Println("No projects found.")
+				fmt.Println("Run: crush-orchestrator init <name> --repos <paths>")
+				return nil
+			}
+
+			fmt.Println("Projects:")
+			for name, path := range projects {
+				// Check if running
+				pidFile := filepath.Join(path, "daemon.pid")
+				status := "stopped"
+				if data, err := os.ReadFile(pidFile); err == nil {
+					var pid int
+					fmt.Sscanf(string(data), "%d", &pid)
+					// Check if process exists
+					if process, err := os.FindProcess(pid); err == nil {
+						if err := process.Signal(syscall.Signal(0)); err == nil {
+							status = "running"
+						}
+					}
+				}
+				fmt.Printf("  • %s (%s) - %s\n", name, path, status)
+			}
+			return nil
+		},
+	}
+
+	cmd.AddCommand(listCmd)
+	return cmd
+}
+
+func resolveCheckpoint(id, action, reason, projectName string) error {
+	stateDir, err := findProjectDir(projectName)
+	if err != nil {
+		return err
+	}
+
 	config, _ := loadConfig(stateDir)
 	secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
@@ -631,6 +711,59 @@ func resolveCheckpoint(id, action, reason string) error {
 		return fmt.Errorf("%s", errResp.Error)
 	}
 	return nil
+}
+
+// --- Project Management ---
+
+func getProjectsFile() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".crush-orchestrator", "projects.json")
+}
+
+func registerProject(name, path string) error {
+	projectsFile := getProjectsFile()
+	os.MkdirAll(filepath.Dir(projectsFile), 0755)
+
+	projects := make(map[string]string)
+	if data, err := os.ReadFile(projectsFile); err == nil {
+		json.Unmarshal(data, &projects)
+	}
+
+	absPath, _ := filepath.Abs(path)
+	projects[name] = absPath
+
+	data, _ := json.MarshalIndent(projects, "", "  ")
+	return os.WriteFile(projectsFile, data, 0644)
+}
+
+func listProjects() map[string]string {
+	projectsFile := getProjectsFile()
+
+	projects := make(map[string]string)
+	if data, err := os.ReadFile(projectsFile); err == nil {
+		json.Unmarshal(data, &projects)
+	}
+
+	return projects
+}
+
+func findProjectDir(projectName string) (string, error) {
+	// If project name specified, look it up
+	if projectName != "" {
+		projects := listProjects()
+		path, ok := projects[projectName]
+		if !ok {
+			return "", fmt.Errorf("project not found: %s", projectName)
+		}
+		return path, nil
+	}
+
+	// Otherwise, check current directory
+	if _, err := os.Stat(".orchestrator/config.json"); err == nil {
+		return ".orchestrator", nil
+	}
+
+	return "", fmt.Errorf("no project found. Specify with --project or run from a project directory")
 }
 
 // --- Helpers ---
@@ -683,7 +816,6 @@ func setupRepoConfig(repoPath, secret string, daemonPort int) error {
 		os.MkdirAll(filepath.Join(opencodeDir, dir), 0755)
 	}
 
-	// Plugin
 	plugin := fmt.Sprintf(`// Orchestration Plugin
 import type { Plugin } from "@opencode-ai/plugin"
 export const OrchestrationPlugin: Plugin = async () => ({})
