@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -65,11 +66,19 @@ through a central hub with shared workspace.`,
 func initCmd() *cobra.Command {
 	var repos []string
 	var force bool
+	var cloneDir string
 
 	cmd := &cobra.Command{
 		Use:   "init [project-name]",
 		Short: "Initialize a new orchestration workspace",
-		Args:  cobra.ExactArgs(1),
+		Long: `Initialize a new orchestration workspace.
+
+Repositories can be specified as:
+  - Local paths: /path/to/repo, ~/code/repo
+  - Remote URLs: git@github.com:org/repo.git, https://github.com/org/repo.git
+
+Remote repositories will be cloned to the specified clone directory.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projectName := args[0]
 			stateDir := ".orchestrator"
@@ -89,20 +98,45 @@ func initCmd() *cobra.Command {
 				return fmt.Errorf("at least one repository required (--repos)")
 			}
 
-			var repoConfigs []Repo
-			for i, repoPath := range repos {
-				absPath, err := filepath.Abs(repoPath)
-				if err != nil {
-					return fmt.Errorf("invalid path %s: %w", repoPath, err)
-				}
+			// Create clone directory if needed
+			if cloneDir == "" {
+				cloneDir = filepath.Join(stateDir, "repos")
+			}
 
-				// Check directory exists
-				info, err := os.Stat(absPath)
-				if err != nil {
-					return fmt.Errorf("repository not found: %s", absPath)
-				}
-				if !info.IsDir() {
-					return fmt.Errorf("not a directory: %s", absPath)
+			var repoConfigs []Repo
+			for i, repoRef := range repos {
+				var absPath string
+				var repoName string
+
+				if isRemoteURL(repoRef) {
+					// Clone remote repository
+					repoName = extractRepoName(repoRef)
+					clonePath := filepath.Join(cloneDir, repoName)
+
+					fmt.Printf("  Cloning %s...\n", repoRef)
+					if err := cloneRepo(repoRef, clonePath); err != nil {
+						return fmt.Errorf("failed to clone %s: %w", repoRef, err)
+					}
+
+					absPath = clonePath
+				} else {
+					// Local path
+					var err error
+					absPath, err = filepath.Abs(repoRef)
+					if err != nil {
+						return fmt.Errorf("invalid path %s: %w", repoRef, err)
+					}
+
+					// Check directory exists
+					info, err := os.Stat(absPath)
+					if err != nil {
+						return fmt.Errorf("repository not found: %s", absPath)
+					}
+					if !info.IsDir() {
+						return fmt.Errorf("not a directory: %s", absPath)
+					}
+
+					repoName = filepath.Base(absPath)
 				}
 
 				// Check if git repo
@@ -111,9 +145,8 @@ func initCmd() *cobra.Command {
 					return fmt.Errorf("not a git repository: %s", absPath)
 				}
 
-				name := filepath.Base(absPath)
 				repoConfigs = append(repoConfigs, Repo{
-					Name: name,
+					Name: repoName,
 					Path: absPath,
 					Port: 9801 + i,
 				})
@@ -174,7 +207,7 @@ func initCmd() *cobra.Command {
 			fmt.Printf("✓ Workspace initialized: %s\n", projectName)
 			fmt.Printf("  Repositories:\n")
 			for _, repo := range repoConfigs {
-				fmt.Printf("    - %s (port %d)\n", repo.Name, repo.Port)
+				fmt.Printf("    - %s (%s, port %d)\n", repo.Name, repo.Path, repo.Port)
 			}
 			fmt.Printf("  State: %s\n", stateDir)
 			fmt.Printf("\nRun 'crush-orchestrator start' to begin.\n")
@@ -183,11 +216,67 @@ func initCmd() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringSliceVar(&repos, "repos", nil, "Repository paths (required)")
+	cmd.Flags().StringSliceVar(&repos, "repos", nil, "Repository paths or git URLs (required)")
 	cmd.MarkFlagRequired("repos")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing workspace")
+	cmd.Flags().StringVar(&cloneDir, "clone-dir", "", "Directory to clone remote repos (default: .orchestrator/repos)")
 
 	return cmd
+}
+
+// isRemoteURL checks if a string looks like a remote git URL
+func isRemoteURL(s string) bool {
+	return strings.HasPrefix(s, "git@") ||
+		strings.HasPrefix(s, "https://") ||
+		strings.HasPrefix(s, "http://") ||
+		strings.HasPrefix(s, "ssh://")
+}
+
+// extractRepoName extracts the repository name from a URL
+// e.g., git@github.com:org/repo.git -> repo
+// e.g., https://github.com/org/repo.git -> repo
+func extractRepoName(url string) string {
+	// Remove trailing .git
+	url = strings.TrimSuffix(url, ".git")
+
+	// Get last path component
+	parts := strings.Split(url, "/")
+	name := parts[len(parts)-1]
+
+	// Handle SSH format (git@github.com:org/repo)
+	if strings.Contains(name, ":") {
+		parts = strings.Split(name, ":")
+		name = parts[len(parts)-1]
+	}
+
+	// If still has org/repo format, take just the repo
+	if strings.Contains(name, "/") {
+		parts = strings.Split(name, "/")
+		name = parts[len(parts)-1]
+	}
+
+	return name
+}
+
+// cloneRepo clones a remote repository to a local directory
+func cloneRepo(url, dest string) error {
+	// Check if already cloned
+	if _, err := os.Stat(filepath.Join(dest, ".git")); err == nil {
+		fmt.Printf("    Already cloned: %s\n", dest)
+		return nil
+	}
+
+	// Create parent directory
+	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+		return err
+	}
+
+	// Run git clone
+	cmd := exec.Command("git", "clone", "--depth=1", url, dest)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
 }
 
 func startCmd() *cobra.Command {

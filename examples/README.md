@@ -17,31 +17,43 @@ multiple AI agents across different repositories.
 go build -o crush-orchestrator ./cmd/orchestrator/
 ```
 
-### 2. Create sample repositories (for testing)
+### 2. Initialize orchestration workspace
 
-```bash
-mkdir -p /tmp/example-repos/{api-gateway,user-service,notification-service}
+You can use either local paths or remote git URLs:
 
-# Initialize git repos
-for repo in api-gateway user-service notification-service; do
-  cd /tmp/example-repos/$repo
-  git init
-  echo "# $repo" > README.md
-  git add . && git commit -m "Initial commit"
-  cd -
-done
-```
-
-### 3. Initialize orchestration workspace
+**Option A: Local repositories**
 
 ```bash
 ./crush-orchestrator init my-project \
-  --repos /tmp/example-repos/api-gateway,/tmp/example-repos/user-service,/tmp/example-repos/notification-service
+  --repos ~/code/api-gateway,~/code/user-service,~/code/notification-service
+```
+
+**Option B: Remote repositories (will be cloned)**
+
+```bash
+./crush-orchestrator init my-project \
+  --repos git@github.com:yourorg/api-gateway.git,git@github.com:yourorg/user-service.git,git@github.com:yourorg/notification-service.git
+```
+
+**Option C: Mix of local and remote**
+
+```bash
+./crush-orchestrator init my-project \
+  --repos ~/code/api-gateway,git@github.com:yourorg/user-service.git
+```
+
+**Custom clone directory (for remote repos):**
+
+```bash
+./crush-orchestrator init my-project \
+  --repos git@github.com:yourorg/api-gateway.git \
+  --clone-dir ~/cloned-repos
 ```
 
 This creates:
 - `.orchestrator/` directory with state files
 - `.opencode/` directories in each repo with plugin, tools, and agent configs
+- Remote repos cloned to `.orchestrator/repos/` (or `--clone-dir`)
 
 ### 4. Start orchestration
 
