@@ -1,0 +1,142 @@
+# TASK-001.yaml
+# Example task definition for implementing user authentication
+
+id: "TASK-001"
+title: "Implement JWT-based user authentication"
+description: |
+  Create a complete authentication system for the e-commerce platform.
+  
+  This task spans multiple services and requires coordination:
+  - API Gateway: JWT middleware for token validation
+  - User Service: Login/logout endpoints with password hashing
+  - Frontend: Login form and token storage
+  
+  Security requirements:
+  - Passwords must be hashed with bcrypt
+  - JWT tokens expire after 24 hours
+  - Refresh token mechanism for extended sessions
+  - Rate limiting on login attempts
+
+type: "feature"
+priority: "high"
+status: "in_progress"
+
+creator: "tech-lead"
+created_at: "2024-01-15T10:00:00Z"
+started_at: "2024-01-15T10:30:00Z"
+
+timeline:
+  due: "2024-01-17T18:00:00Z"
+  estimated_hours: 16
+
+# Sub-tasks assigned to different agents
+sub_tasks:
+  - id: "TASK-001-1"
+    title: "Implement JWT middleware in API Gateway"
+    description: "Create middleware to validate JWT tokens on protected routes"
+    assignee: "backend-dev-a"
+    status: "in_progress"
+    dependencies: []
+    
+  - id: "TASK-001-2"
+    title: "Create login/logout endpoints"
+    description: "Add POST /auth/login and POST /auth/logout endpoints"
+    assignee: "backend-dev-b"
+    status: "pending"
+    dependencies:
+      - "TASK-001-3"  # Needs user model first
+    
+  - id: "TASK-001-3"
+    title: "Update User model with password hashing"
+    description: "Add password_hash field and bcrypt methods"
+    assignee: "backend-dev-b"
+    status: "in_progress"
+    dependencies: []
+    
+  - id: "TASK-001-4"
+    title: "Create login form component"
+    description: "Build React login form with validation"
+    assignee: "frontend-dev"
+    status: "pending"
+    dependencies:
+      - "TASK-001-2"  # Needs API endpoints
+
+# Cross-service dependencies
+dependencies:
+  services:
+    - name: "api-gateway"
+      requires:
+        - "user-service"
+      
+  # Shared resources
+  resources:
+    - type: "database"
+      name: "users"
+      access: ["backend-dev-b"]
+    - type: "redis"
+      name: "session-store"
+      access: ["backend-dev-a", "backend-dev-b"]
+
+# Shared context
+context:
+  related_files:
+    - "docs/auth-requirements.md"
+    - "shared/schemas/auth.json"
+    - "api-gateway/middleware/auth.go"
+    - "user-service/models/user.go"
+  
+  shared_vars:
+    jwt_secret: "${VAULT:jwt_secret}"
+    token_expiry: "24h"
+    refresh_token_expiry: "7d"
+    bcrypt_cost: 12
+    rate_limit: "5 per minute"
+
+# Checkpoints that require human approval
+checkpoints:
+  - id: "CHK-001"
+    description: "Approve database schema changes for User model"
+    status: "pending"
+    required_approvers: ["tech-lead"]
+    blocks_tasks: ["TASK-001-2"]
+    
+  - id: "CHK-002"
+    description: "Approve API contract between services"
+    status: "pending"
+    required_approvers: ["tech-lead"]
+    blocks_tasks: ["TASK-001-4"]
+    
+  - id: "CHK-003"
+    description: "Final review before deployment"
+    status: "pending"
+    required_approvers: ["tech-lead"]
+    blocks_completion: true
+
+# Communication threads
+threads:
+  - id: "thread-001"
+    title: "JWT secret management"
+    participants: ["backend-dev-a", "backend-dev-b", "tech-lead"]
+    messages: 5
+    
+  - id: "thread-002"
+    title: "Rate limiting strategy"
+    participants: ["backend-dev-a", "tech-lead"]
+    messages: 3
+
+# Completion criteria
+acceptance_criteria:
+  - "User can log in with email and password"
+  - "JWT token is returned on successful login"
+  - "Protected routes reject requests without valid token"
+  - "Passwords are stored hashed, never plain text"
+  - "Rate limiting prevents brute force attacks"
+  - "All tests pass (unit, integration, e2e)"
+
+# Tags for filtering
+tags:
+  - "authentication"
+  - "security"
+  - "api-gateway"
+  - "user-service"
+  - "frontend"

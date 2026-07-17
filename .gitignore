@@ -1,0 +1,47 @@
+# Binaries
+crush-orchestrator
+crush-agent
+*.exe
+
+# Go
+*.o
+*.a
+*.so
+*.test
+*.out
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage.out
+coverage.html
+*.cov
+
+# Workspace data (local development)
+workspaces/
+*.db
+*.db-journal
+
+# Config (may contain secrets)
+config.local.yaml
+.env
+.env.local
+
+# Build
+dist/
+build/
+
+# Temporary files
+*.tmp
+*.temp
+*.log

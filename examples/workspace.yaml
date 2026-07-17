@@ -1,0 +1,116 @@
+# workspace.yaml
+# Example workspace configuration for a microservices project
+
+workspace:
+  name: "E-commerce Platform"
+  id: "ecommerce-platform"
+  description: "Multi-service e-commerce system with API gateway, user service, and frontend"
+
+orchestrator:
+  host: "localhost"
+  port: 8080
+  auth:
+    type: "api_key"
+    key: "${ORCHESTRATOR_API_KEY:-dev-key-change-in-production}"
+  
+  # Advanced settings
+  heartbeat_interval: "30s"
+  agent_timeout: "5m"
+  max_concurrent_tasks: 10
+
+agents:
+  # Tech Lead - Coordinates overall architecture
+  - id: "tech-lead"
+    name: "Tech Lead"
+    template: "tech-lead"
+    repo: "./api-gateway"
+    model: "claude-3.7-sonnet"
+    max_tokens: 8000
+    
+  # Backend Developer A - User service
+  - id: "backend-dev-a"
+    name: "Backend Dev A"
+    template: "backend-dev"
+    repo: "./user-service"
+    model: "claude-3.7-sonnet"
+    max_tokens: 4000
+    
+  # Backend Developer B - Order service
+  - id: "backend-dev-b"
+    name: "Backend Dev B"
+    template: "backend-dev"
+    repo: "./order-service"
+    model: "claude-3.7-sonnet"
+    max_tokens: 4000
+    
+  # Frontend Developer
+  - id: "frontend-dev"
+    name: "Frontend Dev"
+    template: "frontend-dev"
+    repo: "./web-frontend"
+    model: "claude-3.7-sonnet"
+    max_tokens: 4000
+
+shared_context:
+  # Files that all agents should be aware of
+  files:
+    - "docs/architecture-overview.md"
+    - "docs/api-contracts.yaml"
+    - "docs/deployment-guide.md"
+    - "shared/schemas/common-types.json"
+  
+  # Auto-sync settings
+  auto_sync: true
+  sync_interval: "30s"
+  
+  # Variables available to all agents
+  variables:
+    api_version: "v2"
+    environment: "development"
+    feature_flags:
+      - "new-checkout-flow"
+      - "enhanced-search"
+
+checkpoints:
+  enabled: true
+  auto_approve: false
+  
+  # Patterns that trigger mandatory checkpoints
+  patterns:
+    - "*.sql"                    # Database migrations
+    - "*/migrations/*"
+    - "*/deploy/*"               # Deployment configs
+    - "*.tf"                     # Terraform
+    - "docker-compose*.yaml"     # Infrastructure
+    - "*.github/workflows/*"     # CI/CD changes
+  
+  # Size thresholds
+  max_lines_changed: 100
+  max_files_changed: 10
+
+communication:
+  # Message retention
+  message_ttl: "7d"
+  max_messages_per_channel: 1000
+  
+  # Notification settings
+  notify_on:
+    - checkpoint_pending
+    - task_completed
+    - agent_offline
+    - error
+
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json" # json, text
+  output: "stdout"
+  file: "logs/orchestrator.log"
+  
+  # Audit log
+  audit:
+    enabled: true
+    file: "logs/audit.log"
+    events:
+      - agent_action
+      - checkpoint_decision
+      - workspace_change
