@@ -1,7 +1,10 @@
 package headless
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,28 +14,34 @@ import (
 	"time"
 )
 
-// Instance represents a headless OpenCode instance
+// Instance represents the single headless OpenCode instance
 type Instance struct {
-	Name   string `json:"name"`
-	Path   string `json:"path"`
 	Port   int    `json:"port"`
 	PID    int    `json:"pid"`
 	Status string `json:"status"`
 	cmd    *exec.Cmd
 }
 
-// Manager manages headless OpenCode instances
+// Session represents a session for a specific project
+type Session struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	Agent     string `json:"agent"`
+	Status    string `json:"status"`
+}
+
+// Manager manages the headless OpenCode instance and sessions
 type Manager struct {
-	instances map[string]*Instance
-	mu        sync.RWMutex
-	nextPort  int
+	instance *Instance
+	sessions map[string]*Session
+	mu       sync.RWMutex
 }
 
 // NewManager creates a new headless manager
-func NewManager(startPort int) *Manager {
+func NewManager() *Manager {
 	return &Manager{
-		instances: make(map[string]*Instance),
-		nextPort:  startPort,
+		sessions: make(map[string]*Session),
 	}
 }
 
@@ -58,18 +67,13 @@ func IsPortAvailable(port int) bool {
 	return true
 }
 
-// Spawn starts a headless OpenCode instance
-func (m *Manager) Spawn(name, dir string, port int) error {
+// Start starts a single headless OpenCode instance
+func (m *Manager) Start(port int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.instances[name]; exists {
-		return fmt.Errorf("instance already exists: %s", name)
-	}
-
-	// Verify directory exists
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return fmt.Errorf("directory not found: %s", dir)
+	if m.instance != nil {
+		return fmt.Errorf("instance already running")
 	}
 
 	// Find available port if requested port is in use
@@ -78,7 +82,7 @@ func (m *Manager) Spawn(name, dir string, port int) error {
 		if err != nil {
 			return fmt.Errorf("port %d in use and no alternatives found", port)
 		}
-		log.Printf("Port %d in use, using %d instead for %s", port, availablePort, name)
+		log.Printf("Port %d in use, using %d instead", port, availablePort)
 		port = availablePort
 	}
 
@@ -93,7 +97,6 @@ func (m *Manager) Spawn(name, dir string, port int) error {
 		"--port", fmt.Sprintf("%d", port),
 		"--hostname", "127.0.0.1",
 	)
-	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		fmt.Sprintf("OPENCODE_PORT=%d", port),
 	)
@@ -104,30 +107,26 @@ func (m *Manager) Spawn(name, dir string, port int) error {
 		return fmt.Errorf("failed to start opencode: %w", err)
 	}
 
-	inst := &Instance{
-		Name:   name,
-		Path:   dir,
+	m.instance = &Instance{
 		Port:   port,
 		PID:    cmd.Process.Pid,
 		Status: "starting",
 		cmd:    cmd,
 	}
 
-	m.instances[name] = inst
-
 	// Wait for ready
-	go m.waitForReady(inst)
+	go m.waitForReady()
 
 	// Monitor
-	go m.monitor(inst)
+	go m.monitor()
 
 	return nil
 }
 
 // waitForReady waits for the instance to be healthy
-func (m *Manager) waitForReady(inst *Instance) {
+func (m *Manager) waitForReady() {
 	client := &http.Client{Timeout: 1 * time.Second}
-	url := fmt.Sprintf("http://127.0.0.1:%d/health", inst.Port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", m.instance.Port)
 
 	for i := 0; i < 30; i++ {
 		time.Sleep(1 * time.Second)
@@ -135,25 +134,25 @@ func (m *Manager) waitForReady(inst *Instance) {
 		resp, err := client.Get(url)
 		if err == nil && resp.StatusCode == 200 {
 			m.mu.Lock()
-			inst.Status = "running"
+			m.instance.Status = "running"
 			m.mu.Unlock()
-			log.Printf("✓ %s ready on port %d", inst.Name, inst.Port)
+			log.Printf("✓ OpenCode ready on port %d", m.instance.Port)
 			return
 		}
 	}
 
 	m.mu.Lock()
-	inst.Status = "failed"
+	m.instance.Status = "failed"
 	m.mu.Unlock()
-	log.Printf("✗ %s failed to start", inst.Name)
+	log.Printf("✗ OpenCode failed to start")
 }
 
 // monitor watches for crashes
-func (m *Manager) monitor(inst *Instance) {
-	err := inst.cmd.Wait()
+func (m *Manager) monitor() {
+	err := m.instance.cmd.Wait()
 
 	m.mu.RLock()
-	status := inst.Status
+	status := m.instance.Status
 	m.mu.RUnlock()
 
 	if status == "stopped" || status == "stopping" {
@@ -161,90 +160,189 @@ func (m *Manager) monitor(inst *Instance) {
 	}
 
 	if err != nil {
-		log.Printf("✗ %s exited: %v", inst.Name, err)
+		log.Printf("✗ OpenCode exited: %v", err)
 	} else {
-		log.Printf("✗ %s exited", inst.Name)
+		log.Printf("✗ OpenCode exited")
 	}
 
 	m.mu.Lock()
-	inst.Status = "stopped"
+	m.instance.Status = "stopped"
 	m.mu.Unlock()
 }
 
-// Stop stops an instance
-func (m *Manager) Stop(name string) error {
+// Stop stops the instance
+func (m *Manager) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	inst, exists := m.instances[name]
-	if !exists {
-		return fmt.Errorf("instance not found: %s", name)
+	if m.instance == nil {
+		return fmt.Errorf("no instance running")
 	}
 
-	inst.Status = "stopping"
+	m.instance.Status = "stopping"
 
-	if inst.cmd != nil && inst.cmd.Process != nil {
-		inst.cmd.Process.Signal(os.Interrupt)
+	if m.instance.cmd != nil && m.instance.cmd.Process != nil {
+		m.instance.cmd.Process.Signal(os.Interrupt)
 
 		done := make(chan error, 1)
 		go func() {
-			done <- inst.cmd.Wait()
+			done <- m.instance.cmd.Wait()
 		}()
 
 		select {
 		case <-done:
 		case <-time.After(10 * time.Second):
-			inst.cmd.Process.Kill()
+			m.instance.cmd.Process.Kill()
 		}
 	}
 
-	delete(m.instances, name)
+	m.instance = nil
 	return nil
 }
 
-// StopAll stops all instances
-func (m *Manager) StopAll() {
-	m.mu.Lock()
-	names := make([]string, 0, len(m.instances))
-	for name := range m.instances {
-		names = append(names, name)
+// GetPort returns the instance port
+func (m *Manager) GetPort() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.instance == nil {
+		return 0
 	}
+	return m.instance.Port
+}
+
+// IsRunning checks if the instance is running
+func (m *Manager) IsRunning() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	return m.instance != nil && m.instance.Status == "running"
+}
+
+// CreateSession creates a new session for a project
+func (m *Manager) CreateSession(name, path, agent string) (*Session, error) {
+	m.mu.RLock()
+	port := 0
+	if m.instance != nil {
+		port = m.instance.Port
+	}
+	m.mu.RUnlock()
+
+	if port == 0 {
+		return nil, fmt.Errorf("no instance running")
+	}
+
+	// Create session via OpenCode API
+	url := fmt.Sprintf("http://127.0.0.1:%d/session.create", port)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"title": fmt.Sprintf("%s - %s", name, agent),
+	})
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create session: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	session := &Session{
+		ID:     result.ID,
+		Name:   name,
+		Path:   path,
+		Agent:  agent,
+		Status: "active",
+	}
+
+	m.mu.Lock()
+	m.sessions[name] = session
 	m.mu.Unlock()
 
-	for _, name := range names {
-		m.Stop(name)
+	log.Printf("✓ Session created for %s (ID: %s)", name, result.ID)
+
+	return session, nil
+}
+
+// GetSession returns a session by name
+func (m *Manager) GetSession(name string) (*Session, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	session, ok := m.sessions[name]
+	return session, ok
+}
+
+// ListSessions returns all sessions
+func (m *Manager) ListSessions() []*Session {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	sessions := make([]*Session, 0, len(m.sessions))
+	for _, s := range m.sessions {
+		sessions = append(sessions, s)
 	}
+	return sessions
 }
 
-// GetInstance returns an instance by name
-func (m *Manager) GetInstance(name string) (*Instance, bool) {
+// SendPrompt sends a prompt to a session
+func (m *Manager) SendPrompt(sessionName, prompt string) (string, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	inst, ok := m.instances[name]
-	return inst, ok
-}
-
-// ListInstances returns all instances
-func (m *Manager) ListInstances() []*Instance {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	instances := make([]*Instance, 0, len(m.instances))
-	for _, inst := range m.instances {
-		instances = append(instances, inst)
+	session, ok := m.sessions[sessionName]
+	port := 0
+	if m.instance != nil {
+		port = m.instance.Port
 	}
-	return instances
-}
+	m.mu.RUnlock()
 
-// GetInstancePort returns the port for an instance
-func (m *Manager) GetInstancePort(name string) (int, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	inst, ok := m.instances[name]
 	if !ok {
-		return 0, false
+		return "", fmt.Errorf("session not found: %s", sessionName)
 	}
-	return inst.Port, true
+
+	if port == 0 {
+		return "", fmt.Errorf("no instance running")
+	}
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/session.prompt", port)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"sessionID": session.ID,
+		"parts": []map[string]string{
+			{"type": "text", "text": prompt},
+		},
+	})
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return "", fmt.Errorf("failed to send prompt: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Content string `json:"content"`
+		Text    string `json:"text"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "Message sent", nil
+	}
+
+	if result.Content != "" {
+		return result.Content, nil
+	}
+	return result.Text, nil
 }

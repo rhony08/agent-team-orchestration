@@ -1,10 +1,7 @@
 package daemon
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -12,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rhony08/agent-team-orchestration/pkg/headless"
 	"github.com/rhony08/agent-team-orchestration/pkg/state"
 )
 
@@ -23,28 +21,11 @@ type Daemon struct {
 	authSecret string
 	startTime  time.Time
 	httpServer *http.Server
-
-	// Instance registry (name -> port mapping)
-	instancePorts map[string]int
-	portMu        sync.RWMutex
-
-	// Connected instances (registered via API)
-	instances map[string]*Instance
-	instMu    sync.RWMutex
+	headless   *headless.Manager
 
 	// Checkpoint resolution channels
 	cpHandlers map[string]chan CheckpointResult
 	cpMu       sync.Mutex
-}
-
-// Instance represents a connected OpenCode instance
-type Instance struct {
-	ID       string    `json:"id"`
-	Name     string    `json:"name"`
-	Path     string    `json:"path"`
-	Port     int       `json:"port"`
-	Status   string    `json:"status"`
-	LastSeen time.Time `json:"last_seen"`
 }
 
 // CheckpointResult holds the user's decision
@@ -54,44 +35,35 @@ type CheckpointResult struct {
 }
 
 // New creates a new daemon
-func New(stateManager *state.Manager, port int, authSecret string) *Daemon {
+func New(stateManager *state.Manager, port int, authSecret string, headlessMgr *headless.Manager) *Daemon {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.Recovery())
 
 	d := &Daemon{
-		router:        router,
-		state:         stateManager,
-		port:          port,
-		authSecret:    authSecret,
-		startTime:     time.Now(),
-		instancePorts: make(map[string]int),
-		instances:     make(map[string]*Instance),
-		cpHandlers:    make(map[string]chan CheckpointResult),
+		router:     router,
+		state:      stateManager,
+		port:       port,
+		authSecret: authSecret,
+		startTime:  time.Now(),
+		headless:   headlessMgr,
+		cpHandlers: make(map[string]chan CheckpointResult),
 	}
 
 	d.setupRoutes()
 	return d
 }
 
-// RegisterInstancePort registers the port for an instance
-func (d *Daemon) RegisterInstancePort(name string, port int) {
-	d.portMu.Lock()
-	defer d.portMu.Unlock()
-	d.instancePorts[name] = port
-}
-
 func (d *Daemon) setupRoutes() {
 	// Health (no auth)
 	d.router.GET("/health", d.healthHandler)
 
-	// Instance registration (auth required)
-	d.router.POST("/api/v1/instances/register", d.authMiddleware(), d.registerInstance)
-	d.router.POST("/api/v1/instances/:id/heartbeat", d.authMiddleware(), d.heartbeat)
-	d.router.GET("/api/v1/instances", d.authMiddleware(), d.listInstances)
+	// Sessions
+	d.router.POST("/api/v1/sessions", d.authMiddleware(), d.createSession)
+	d.router.GET("/api/v1/sessions", d.authMiddleware(), d.listSessions)
 
-	// Send message to instance
-	d.router.POST("/api/v1/send", d.authMiddleware(), d.sendToInstance)
+	// Send message to session
+	d.router.POST("/api/v1/send", d.authMiddleware(), d.sendToSession)
 
 	// Tasks
 	d.router.POST("/api/v1/tasks", d.authMiddleware(), d.createTask)
@@ -136,44 +108,22 @@ func (d *Daemon) Stop() {
 	}
 }
 
-// WaitForCheckpoint blocks until a checkpoint is resolved
-func (d *Daemon) WaitForCheckpoint(cpID string, timeout time.Duration) CheckpointResult {
-	ch := make(chan CheckpointResult, 1)
-
-	d.cpMu.Lock()
-	d.cpHandlers[cpID] = ch
-	d.cpMu.Unlock()
-
-	defer func() {
-		d.cpMu.Lock()
-		delete(d.cpHandlers, cpID)
-		d.cpMu.Unlock()
-	}()
-
-	select {
-	case result := <-ch:
-		return result
-	case <-time.After(timeout):
-		return CheckpointResult{Approved: false, Reason: "timeout"}
-	}
-}
-
 // --- Handlers ---
 
 func (d *Daemon) healthHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"status":    "ok",
-		"uptime":    time.Since(d.startTime).String(),
-		"version":   "1.0.0",
-		"instances": len(d.instancePorts),
+		"status":   "ok",
+		"uptime":   time.Since(d.startTime).String(),
+		"version":  "1.0.0",
+		"sessions": len(d.headless.ListSessions()),
 	})
 }
 
-func (d *Daemon) registerInstance(c *gin.Context) {
+func (d *Daemon) createSession(c *gin.Context) {
 	var req struct {
-		Name string `json:"name" binding:"required"`
-		Path string `json:"path" binding:"required"`
-		Port int    `json:"port"`
+		Name  string `json:"name" binding:"required"`
+		Path  string `json:"path" binding:"required"`
+		Agent string `json:"agent"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -181,209 +131,66 @@ func (d *Daemon) registerInstance(c *gin.Context) {
 		return
 	}
 
-	id := uuid.New().String()
-	instance := &Instance{
-		ID:       id,
-		Name:     req.Name,
-		Path:     req.Path,
-		Port:     req.Port,
-		Status:   "connected",
-		LastSeen: time.Now(),
+	if req.Agent == "" {
+		req.Agent = "build"
 	}
 
-	d.instMu.Lock()
-	d.instances[id] = instance
-	d.instMu.Unlock()
-
-	// Register port mapping
-	if req.Port > 0 {
-		d.RegisterInstancePort(req.Name, req.Port)
-	}
-
-	log.Printf("Instance connected: %s from %s (port %d)", req.Name, req.Path, req.Port)
-
-	c.JSON(http.StatusOK, gin.H{
-		"instance_id": id,
-		"status":      "registered",
-	})
-}
-
-func (d *Daemon) heartbeat(c *gin.Context) {
-	id := c.Param("id")
-
-	d.instMu.Lock()
-	if inst, ok := d.instances[id]; ok {
-		inst.LastSeen = time.Now()
-		inst.Status = "connected"
-	}
-	d.instMu.Unlock()
-
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
-}
-
-func (d *Daemon) listInstances(c *gin.Context) {
-	d.instMu.RLock()
-	instances := make([]*Instance, 0, len(d.instances))
-	for _, inst := range d.instances {
-		instances = append(instances, inst)
-	}
-	d.instMu.RUnlock()
-
-	c.JSON(http.StatusOK, instances)
-}
-
-func (d *Daemon) sendToInstance(c *gin.Context) {
-	var req struct {
-		Instance string `json:"instance" binding:"required"`
-		Message  string `json:"message" binding:"required"`
-		Agent    string `json:"agent"`
-	}
-
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Find instance port
-	d.portMu.RLock()
-	port, exists := d.instancePorts[req.Instance]
-	d.portMu.RUnlock()
-
-	if !exists {
-		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("instance not found: %s", req.Instance)})
-		return
-	}
-
-	// Send to OpenCode instance
-	agentType := req.Agent
-	if agentType == "" {
-		agentType = "build" // default agent
-	}
-
-	response, err := d.forwardToOpenCode(port, agentType, req.Message)
+	session, err := d.headless.CreateSession(req.Name, req.Path, req.Agent)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to send to %s: %v", req.Instance, err)})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, session)
+}
+
+func (d *Daemon) listSessions(c *gin.Context) {
+	sessions := d.headless.ListSessions()
+	c.JSON(http.StatusOK, sessions)
+}
+
+func (d *Daemon) sendToSession(c *gin.Context) {
+	var req struct {
+		Session string `json:"session" binding:"required"`
+		Message string `json:"message" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	response, err := d.headless.SendPrompt(req.Session, req.Message)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"instance": req.Instance,
+		"session":  req.Session,
 		"response": response,
 	})
-}
-
-// forwardToOpenCode sends a message to an OpenCode instance
-func (d *Daemon) forwardToOpenCode(port int, agent, message string) (string, error) {
-	// Create session
-	sessionID, err := d.createOpenCodeSession(port, agent)
-	if err != nil {
-		return "", fmt.Errorf("failed to create session: %w", err)
-	}
-
-	// Send prompt
-	response, err := d.sendOpenCodePrompt(port, sessionID, message)
-	if err != nil {
-		return "", fmt.Errorf("failed to send prompt: %w", err)
-	}
-
-	return response, nil
-}
-
-// createOpenCodeSession creates a session in an OpenCode instance
-func (d *Daemon) createOpenCodeSession(port int, agent string) (string, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/session.create", port)
-
-	body, _ := json.Marshal(map[string]interface{}{
-		"agent": agent,
-	})
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		ID string `json:"id"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
-	}
-
-	return result.ID, nil
-}
-
-// sendOpenCodePrompt sends a prompt to an OpenCode session
-func (d *Daemon) sendOpenCodePrompt(port int, sessionID, prompt string) (string, error) {
-	url := fmt.Sprintf("http://127.0.0.1:%d/session.prompt", port)
-
-	body, _ := json.Marshal(map[string]interface{}{
-		"sessionID": sessionID,
-		"parts": []map[string]string{
-			{"type": "text", "text": prompt},
-		},
-	})
-
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var result struct {
-		Content string `json:"content"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		// Try alternative response format
-		var altResult struct {
-			Text string `json:"text"`
-		}
-		if err2 := json.NewDecoder(resp.Body).Decode(&altResult); err2 != nil {
-			return "Message sent (no response)", nil
-		}
-		return altResult.Text, nil
-	}
-
-	return result.Content, nil
 }
 
 func (d *Daemon) statusHandler(c *gin.Context) {
 	summary, _ := d.state.GetSummary()
 
-	// Get instance statuses
-	d.portMu.RLock()
-	instanceStatuses := make([]gin.H, 0)
-	for name, port := range d.instancePorts {
-		status := "unknown"
-		client := &http.Client{Timeout: 1 * time.Second}
-		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
-		if err == nil && resp.StatusCode == 200 {
-			status = "running"
-		} else {
-			status = "unreachable"
-		}
-		instanceStatuses = append(instanceStatuses, gin.H{
-			"name":   name,
-			"port":   port,
-			"status": status,
+	sessions := d.headless.ListSessions()
+	sessionStatuses := make([]gin.H, 0)
+	for _, s := range sessions {
+		sessionStatuses = append(sessionStatuses, gin.H{
+			"id":     s.ID,
+			"name":   s.Name,
+			"agent":  s.Agent,
+			"status": s.Status,
 		})
 	}
-	d.portMu.RUnlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"running":   true,
 		"uptime":    time.Since(d.startTime).String(),
-		"instances": instanceStatuses,
+		"opencode":  d.headless.IsRunning(),
+		"sessions":  sessionStatuses,
 		"stats":     summary.Stats,
 	})
 }

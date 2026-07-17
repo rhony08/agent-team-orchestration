@@ -38,7 +38,6 @@ type Config struct {
 type Repo struct {
 	Name  string `json:"name"`
 	Path  string `json:"path"`
-	Port  int    `json:"port"`
 	IsGit bool   `json:"is_git"`
 }
 
@@ -48,8 +47,8 @@ func main() {
 		Short: "Orchestrate multiple OpenCode agents across projects",
 		Long: `Agent Team Orchestrator for OpenCode
 
-Runs OpenCode instances in headless mode and coordinates them through
-a central daemon. Users interact via CLI commands.
+Runs ONE headless OpenCode instance and creates multiple sessions
+for each project. Users interact via CLI commands.
 
 Workflow:
   crush-orchestrator init my-project --repos ./repo1,./repo2
@@ -66,8 +65,7 @@ Workflow:
 	rootCmd.AddCommand(taskCmd())
 	rootCmd.AddCommand(checkpointCmd())
 	rootCmd.AddCommand(projectCmd())
-	rootCmd.AddCommand(instancesCmd())
-	rootCmd.AddCommand(logsCmd())
+	rootCmd.AddCommand(sessionsCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -101,7 +99,6 @@ func initCmd() *cobra.Command {
 			}
 
 			var repoConfigs []Repo
-			portOffset := 0
 			for _, repoRef := range repos {
 				var absPath, repoName string
 				var isGit bool
@@ -134,10 +131,8 @@ func initCmd() *cobra.Command {
 				repoConfigs = append(repoConfigs, Repo{
 					Name:  repoName,
 					Path:  absPath,
-					Port:  9801 + portOffset,
 					IsGit: isGit,
 				})
-				portOffset++
 			}
 
 			secret := generateSecret()
@@ -166,12 +161,7 @@ func initCmd() *cobra.Command {
 			os.WriteFile(filepath.Join(stateDir, "config.json"), configData, 0644)
 			os.WriteFile(filepath.Join(stateDir, "auth.key"), []byte(secret), 0600)
 
-			// Register in global projects list
 			registerProject(projectName, stateDir)
-
-			for _, repo := range repoConfigs {
-				setupRepoConfig(repo.Path, secret, config.Port)
-			}
 
 			fmt.Printf("✓ Initialized: %s\n", projectName)
 			for _, r := range repoConfigs {
@@ -179,7 +169,7 @@ func initCmd() *cobra.Command {
 				if !r.IsGit {
 					tag = " (no git)"
 				}
-				fmt.Printf("  • %s (port %d)%s\n", r.Name, r.Port, tag)
+				fmt.Printf("  • %s%s\n", r.Name, tag)
 			}
 			fmt.Printf("\nRun: crush-orchestrator start\n")
 
@@ -201,9 +191,10 @@ func startCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start orchestration daemon and headless instances",
+		Short: "Start orchestration daemon with one headless OpenCode",
+		Long: `Starts the orchestration daemon and ONE headless OpenCode instance.
+Sessions are created for each project repository.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Find project to start
 			stateDir, err := findProjectDir(projectName)
 			if err != nil {
 				return err
@@ -217,12 +208,10 @@ func startCmd() *cobra.Command {
 			secretBytes, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 			secret := string(secretBytes)
 
-			// Use config port if not overridden
 			if port == 9800 && config.Port != 0 {
 				port = config.Port
 			}
 
-			// Check if daemon port is available
 			if !headless.IsPortAvailable(port) {
 				return fmt.Errorf("port %d is already in use. Is the daemon already running?", port)
 			}
@@ -232,54 +221,63 @@ func startCmd() *cobra.Command {
 				return err
 			}
 
-			d := daemon.New(stateManager, port, secret)
+			// Create headless manager (single OpenCode instance)
+			hm := headless.NewManager()
 
-			// Register instance ports with daemon
-			for _, repo := range config.Repos {
-				d.RegisterInstancePort(repo.Name, repo.Port)
+			// Start OpenCode on a separate port (9900 by default)
+			opencodePort := 9900
+			fmt.Printf("Starting headless OpenCode on port %d...\n", opencodePort)
+			if err := hm.Start(opencodePort); err != nil {
+				return fmt.Errorf("failed to start OpenCode: %w", err)
 			}
 
+			// Wait for OpenCode to be ready
+			fmt.Println("Waiting for OpenCode to be ready...")
+			for i := 0; i < 15; i++ {
+				if hm.IsRunning() {
+					break
+				}
+				time.Sleep(1 * time.Second)
+			}
+
+			if !hm.IsRunning() {
+				return fmt.Errorf("OpenCode failed to start")
+			}
+
+			// Create sessions for each repo
+			fmt.Println("Creating sessions for each project...")
+			for _, repo := range config.Repos {
+				session, err := hm.CreateSession(repo.Name, repo.Path, "build")
+				if err != nil {
+					fmt.Printf("  ✗ %s: %v\n", repo.Name, err)
+				} else {
+					fmt.Printf("  ✓ %s (session: %s)\n", repo.Name, session.ID[:8])
+				}
+			}
+
+			// Create daemon
+			d := daemon.New(stateManager, port, secret, hm)
 			if err := d.Start(); err != nil {
 				return err
 			}
 
-			hm := headless.NewManager(9801)
+			sessions := hm.ListSessions()
 
-			fmt.Printf("╔══════════════════════════════════════════════════╗\n")
+			fmt.Printf("\n╔══════════════════════════════════════════════════╗\n")
 			fmt.Printf("║  ORCHESTRATION DAEMON                           \n")
 			fmt.Printf("╠══════════════════════════════════════════════════╣\n")
-			fmt.Printf("║  Daemon: http://localhost:%d\n", port)
-			fmt.Printf("║  Project: %s\n", config.Project)
+			fmt.Printf("║  Daemon:   http://localhost:%d\n", port)
+			fmt.Printf("║  OpenCode: http://localhost:%d (headless)\n", opencodePort)
+			fmt.Printf("║  Project:  %s\n", config.Project)
 			fmt.Printf("║                                                  \n")
-			fmt.Printf("║  Starting headless instances...\n")
-
-			for _, repo := range config.Repos {
-				fmt.Printf("║    Starting %s...\n", repo.Name)
-				if err := hm.Spawn(repo.Name, repo.Path, repo.Port); err != nil {
-					fmt.Printf("║    ✗ %s: %v\n", repo.Name, err)
-				}
+			fmt.Printf("║  Sessions:\n")
+			for _, s := range sessions {
+				fmt.Printf("║    • %s (%s)\n", s.Name, s.ID[:8])
 			}
-
-			fmt.Printf("║  Waiting for instances...\n")
-			time.Sleep(5 * time.Second)
-
-			instances := hm.ListInstances()
-			running := 0
-			for _, inst := range instances {
-				symbol := "✓"
-				if inst.Status != "running" {
-					symbol = "✗"
-				} else {
-					running++
-				}
-				fmt.Printf("║    %s %s: %s (port %d)\n", symbol, inst.Name, inst.Status, inst.Port)
-			}
-
-			fmt.Printf("║                                                  \n")
-			fmt.Printf("║  %d/%d instances running\n", running, len(instances))
 			fmt.Printf("║                                                  \n")
 			fmt.Printf("║  Commands:\n")
 			fmt.Printf("║    crush-orchestrator send <repo> <message>\n")
+			fmt.Printf("║    crush-orchestrator sessions\n")
 			fmt.Printf("║    crush-orchestrator task create ...\n")
 			fmt.Printf("║    crush-orchestrator checkpoint list\n")
 			fmt.Printf("╚══════════════════════════════════════════════════╝\n")
@@ -293,7 +291,7 @@ func startCmd() *cobra.Command {
 			<-sigCh
 
 			fmt.Println("\nShutting down...")
-			hm.StopAll()
+			hm.Stop()
 			d.Stop()
 			os.Remove(pidFile)
 			fmt.Println("✓ Stopped.")
@@ -303,7 +301,7 @@ func startCmd() *cobra.Command {
 	}
 
 	cmd.Flags().IntVarP(&port, "port", "p", 9800, "Daemon port")
-	cmd.Flags().StringVar(&projectName, "project", "", "Project name (default: from current directory)")
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
 
 	return cmd
 }
@@ -313,7 +311,7 @@ func stopCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "stop",
-		Short: "Stop the daemon and all instances",
+		Short: "Stop the daemon and OpenCode",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir, err := findProjectDir(projectName)
 			if err != nil {
@@ -347,7 +345,7 @@ func statusCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show daemon and instance status",
+		Short: "Show daemon and session status",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir, err := findProjectDir(projectName)
 			if err != nil {
@@ -369,11 +367,14 @@ func statusCmd() *cobra.Command {
 			defer resp.Body.Close()
 
 			var status struct {
-				Running   bool `json:"running"`
-				Instances []struct {
+				Running  bool `json:"running"`
+				OpenCode bool `json:"opencode"`
+				Sessions []struct {
+					ID     string `json:"id"`
 					Name   string `json:"name"`
+					Agent  string `json:"agent"`
 					Status string `json:"status"`
-				} `json:"instances"`
+				} `json:"sessions"`
 				Stats struct {
 					ActiveTasks        int `json:"active_tasks"`
 					CompletedTasks     int `json:"completed_tasks"`
@@ -383,13 +384,14 @@ func statusCmd() *cobra.Command {
 			json.NewDecoder(resp.Body).Decode(&status)
 
 			fmt.Printf("Project: %s\n", config.Project)
-			fmt.Println("Daemon: running")
-			fmt.Printf("Tasks: %d active, %d completed\n", status.Stats.ActiveTasks, status.Stats.CompletedTasks)
-			fmt.Printf("Checkpoints: %d pending\n", status.Stats.PendingCheckpoints)
-			fmt.Println("\nInstances:")
-			for _, inst := range status.Instances {
-				fmt.Printf("  • %s: %s\n", inst.Name, inst.Status)
+			fmt.Printf("Daemon: running\n")
+			fmt.Printf("OpenCode: %v\n", map[bool]string{true: "running", false: "stopped"}[status.OpenCode])
+			fmt.Printf("\nSessions:\n")
+			for _, s := range status.Sessions {
+				fmt.Printf("  • %s [%s] - %s\n", s.Name, s.Agent, s.ID[:8])
 			}
+			fmt.Printf("\nTasks: %d active, %d completed\n", status.Stats.ActiveTasks, status.Stats.CompletedTasks)
+			fmt.Printf("Checkpoints: %d pending\n", status.Stats.PendingCheckpoints)
 			return nil
 		},
 	}
@@ -402,11 +404,16 @@ func sendCmd() *cobra.Command {
 	var projectName string
 
 	cmd := &cobra.Command{
-		Use:   "send [instance] [message]",
-		Short: "Send a message to an OpenCode instance",
-		Args:  cobra.ExactArgs(2),
+		Use:   "send [session] [message]",
+		Short: "Send a message to a session",
+		Long: `Send a message to a project session.
+
+Example:
+  crush-orchestrator send todo-api "implement JWT authentication"
+  crush-orchestrator send todo-db "create Prisma schema for users"`,
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			instanceName := args[0]
+			sessionName := args[0]
 			message := args[1]
 
 			stateDir, err := findProjectDir(projectName)
@@ -417,11 +424,10 @@ func sendCmd() *cobra.Command {
 			config, _ := loadConfig(stateDir)
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
-			// Send via daemon
 			url := fmt.Sprintf("http://localhost:%d/api/v1/send", config.Port)
 			body, _ := json.Marshal(map[string]string{
-				"instance": instanceName,
-				"message":  message,
+				"session": sessionName,
+				"message": message,
 			})
 
 			req, _ := http.NewRequest("POST", url, strings.NewReader(string(body)))
@@ -444,7 +450,59 @@ func sendCmd() *cobra.Command {
 				return fmt.Errorf("%s", result.Error)
 			}
 
-			fmt.Printf("Response from %s:\n%s\n", instanceName, result.Response)
+			fmt.Printf("Response from %s:\n%s\n", sessionName, result.Response)
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
+}
+
+func sessionsCmd() *cobra.Command {
+	var projectName string
+
+	cmd := &cobra.Command{
+		Use:   "sessions",
+		Short: "List active sessions",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
+			config, _ := loadConfig(stateDir)
+			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
+
+			url := fmt.Sprintf("http://localhost:%d/api/v1/sessions", config.Port)
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("Authorization", "Bearer "+string(secret))
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("daemon not running")
+			}
+			defer resp.Body.Close()
+
+			var sessions []struct {
+				ID     string `json:"id"`
+				Name   string `json:"name"`
+				Path   string `json:"path"`
+				Agent  string `json:"agent"`
+				Status string `json:"status"`
+			}
+			json.NewDecoder(resp.Body).Decode(&sessions)
+
+			if len(sessions) == 0 {
+				fmt.Println("No active sessions.")
+				return nil
+			}
+
+			fmt.Printf("%-20s %-10s %-40s %s\n", "SESSION", "AGENT", "ID", "PATH")
+			fmt.Printf("%-20s %-10s %-40s %s\n", "───────", "─────", "──", "────")
+			for _, s := range sessions {
+				fmt.Printf("%-20s %-10s %-40s %s\n", s.Name, s.Agent, s.ID, s.Path)
+			}
 			return nil
 		},
 	}
@@ -510,7 +568,7 @@ func taskCmd() *cobra.Command {
 
 	createCmd.Flags().String("title", "", "Task title")
 	createCmd.Flags().String("description", "", "Task description")
-	createCmd.Flags().String("assignee", "", "Assign to instance")
+	createCmd.Flags().String("assignee", "", "Assign to session")
 	createCmd.Flags().String("priority", "medium", "Priority: critical, high, medium, low")
 	createCmd.MarkFlagRequired("title")
 	createCmd.MarkFlagRequired("description")
@@ -660,13 +718,11 @@ func projectCmd() *cobra.Command {
 
 			fmt.Println("Projects:")
 			for name, path := range projects {
-				// Check if running
 				pidFile := filepath.Join(path, "daemon.pid")
 				status := "stopped"
 				if data, err := os.ReadFile(pidFile); err == nil {
 					var pid int
 					fmt.Sscanf(string(data), "%d", &pid)
-					// Check if process exists
 					if process, err := os.FindProcess(pid); err == nil {
 						if err := process.Signal(syscall.Signal(0)); err == nil {
 							status = "running"
@@ -680,195 +736,6 @@ func projectCmd() *cobra.Command {
 	}
 
 	cmd.AddCommand(listCmd)
-	return cmd
-}
-
-func instancesCmd() *cobra.Command {
-	var projectName string
-
-	cmd := &cobra.Command{
-		Use:   "instances",
-		Short: "Show detailed instance information",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir, err := findProjectDir(projectName)
-			if err != nil {
-				return err
-			}
-
-			config, _ := loadConfig(stateDir)
-			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
-
-			client := &http.Client{Timeout: 2 * time.Second}
-
-			fmt.Printf("Project: %s\n\n", config.Project)
-			fmt.Printf("%-20s %-10s %-8s %-30s\n", "INSTANCE", "STATUS", "PORT", "MODEL")
-			fmt.Printf("%-20s %-10s %-8s %-30s\n", "────────", "──────", "────", "─────")
-
-			for _, repo := range config.Repos {
-				status := "stopped"
-				model := "unknown"
-
-				// Check health
-				healthURL := fmt.Sprintf("http://127.0.0.1:%d/health", repo.Port)
-				resp, err := client.Get(healthURL)
-				if err == nil && resp.StatusCode == 200 {
-					status = "running"
-					resp.Body.Close()
-
-					// Get model info via OpenCode API
-					modelURL := fmt.Sprintf("http://127.0.0.1:%d/config.get", repo.Port)
-					req, _ := http.NewRequest("GET", modelURL, nil)
-					req.Header.Set("Authorization", "Bearer "+string(secret))
-
-					modelResp, err := client.Do(req)
-					if err == nil && modelResp.StatusCode == 200 {
-						var configResp struct {
-							Model string `json:"model"`
-						}
-						json.NewDecoder(modelResp.Body).Decode(&configResp)
-						if configResp.Model != "" {
-							model = configResp.Model
-						}
-						modelResp.Body.Close()
-					}
-				}
-
-				fmt.Printf("%-20s %-10s %-8d %-30s\n", repo.Name, status, repo.Port, model)
-			}
-
-			// Show tasks summary
-			fmt.Printf("\n─── Tasks ───\n")
-			tasksURL := fmt.Sprintf("http://localhost:%d/api/v1/tasks", config.Port)
-			req, _ := http.NewRequest("GET", tasksURL, nil)
-			req.Header.Set("Authorization", "Bearer "+string(secret))
-
-			resp, err := client.Do(req)
-			if err == nil {
-				var tasks []struct {
-					ID       string `json:"id"`
-					Title    string `json:"title"`
-					Status   string `json:"status"`
-					Assignee string `json:"assignee"`
-				}
-				json.NewDecoder(resp.Body).Decode(&tasks)
-				resp.Body.Close()
-
-				if len(tasks) == 0 {
-					fmt.Println("  No tasks yet.")
-				} else {
-					for _, t := range tasks {
-						fmt.Printf("  [%s] %s (%s) → %s\n", t.ID[:8], t.Title, t.Status, t.Assignee)
-					}
-				}
-			}
-
-			// Show checkpoints
-			fmt.Printf("\n─── Checkpoints ───\n")
-			cpURL := fmt.Sprintf("http://localhost:%d/api/v1/checkpoints", config.Port)
-			req, _ = http.NewRequest("GET", cpURL, nil)
-			req.Header.Set("Authorization", "Bearer "+string(secret))
-
-			resp, err = client.Do(req)
-			if err == nil {
-				var cps []struct {
-					ID          string `json:"id"`
-					Description string `json:"description"`
-					Status      string `json:"status"`
-					Requester   string `json:"requester"`
-				}
-				json.NewDecoder(resp.Body).Decode(&cps)
-				resp.Body.Close()
-
-				if len(cps) == 0 {
-					fmt.Println("  No pending checkpoints.")
-				} else {
-					for _, cp := range cps {
-						fmt.Printf("  [%s] %s (from: %s) - %s\n", cp.ID[:8], cp.Description, cp.Requester, cp.Status)
-					}
-				}
-			}
-
-			return nil
-		},
-	}
-
-	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
-	return cmd
-}
-
-func logsCmd() *cobra.Command {
-	var projectName string
-	var instanceName string
-	var follow bool
-
-	cmd := &cobra.Command{
-		Use:   "logs",
-		Short: "Show instance logs",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			stateDir, err := findProjectDir(projectName)
-			if err != nil {
-				return err
-			}
-
-			config, _ := loadConfig(stateDir)
-
-			if instanceName != "" {
-				// Show logs for specific instance
-				var port int
-				for _, repo := range config.Repos {
-					if repo.Name == instanceName {
-						port = repo.Port
-						break
-					}
-				}
-				if port == 0 {
-					return fmt.Errorf("instance not found: %s", instanceName)
-				}
-
-				fmt.Printf("Logs for %s (port %d):\n", instanceName, port)
-
-				// Query OpenCode sessions
-				url := fmt.Sprintf("http://127.0.0.1:%d/session.list", port)
-				resp, err := http.Get(url)
-				if err != nil {
-					return fmt.Errorf("instance not responding")
-				}
-				defer resp.Body.Close()
-
-				var sessions []struct {
-					ID    string `json:"id"`
-					Title string `json:"title"`
-				}
-				json.NewDecoder(resp.Body).Decode(&sessions)
-
-				fmt.Printf("\nActive sessions:\n")
-				for _, s := range sessions {
-					fmt.Printf("  • %s: %s\n", s.ID, s.Title)
-				}
-			} else {
-				// Show all instances
-				fmt.Printf("Available instances:\n")
-				for _, repo := range config.Repos {
-					status := "stopped"
-					client := &http.Client{Timeout: 1 * time.Second}
-					resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", repo.Port))
-					if err == nil && resp.StatusCode == 200 {
-						status = "running"
-						resp.Body.Close()
-					}
-					fmt.Printf("  • %s (port %d) - %s\n", repo.Name, repo.Port, status)
-				}
-				fmt.Printf("\nUse: crush-orchestrator logs --instance <name>\n")
-			}
-
-			return nil
-		},
-	}
-
-	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
-	cmd.Flags().StringVarP(&instanceName, "instance", "i", "", "Instance name")
-	cmd.Flags().BoolVarP(&follow, "follow", "f", false, "Follow logs (not implemented)")
-
 	return cmd
 }
 
@@ -945,7 +812,6 @@ func listProjects() map[string]string {
 }
 
 func findProjectDir(projectName string) (string, error) {
-	// If project name specified, look it up
 	if projectName != "" {
 		projects := listProjects()
 		path, ok := projects[projectName]
@@ -955,7 +821,6 @@ func findProjectDir(projectName string) (string, error) {
 		return path, nil
 	}
 
-	// Otherwise, check current directory
 	if _, err := os.Stat(".orchestrator/config.json"); err == nil {
 		return ".orchestrator", nil
 	}
@@ -1005,19 +870,4 @@ func cloneRepo(url, dest string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
-}
-
-func setupRepoConfig(repoPath, secret string, daemonPort int) error {
-	opencodeDir := filepath.Join(repoPath, ".opencode")
-	for _, dir := range []string{"plugins", "tools", "agents"} {
-		os.MkdirAll(filepath.Join(opencodeDir, dir), 0755)
-	}
-
-	plugin := fmt.Sprintf(`// Orchestration Plugin
-import type { Plugin } from "@opencode-ai/plugin"
-export const OrchestrationPlugin: Plugin = async () => ({})
-`)
-	os.WriteFile(filepath.Join(opencodeDir, "plugins", "orchestration.ts"), []byte(plugin), 0644)
-
-	return nil
 }
