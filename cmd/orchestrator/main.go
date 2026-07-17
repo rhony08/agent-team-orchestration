@@ -27,12 +27,13 @@ var (
 )
 
 type Config struct {
-	Version    string `json:"version"`
-	Project    string `json:"project"`
-	Repos      []Repo `json:"repos"`
-	AuthSecret string `json:"-"`
-	Port       int    `json:"port"`
-	CreatedAt  string `json:"created_at"`
+	Version       string `json:"version"`
+	Project       string `json:"project"`
+	Repos         []Repo `json:"repos"`
+	AuthSecret    string `json:"-"`
+	Port          int    `json:"port"`
+	OpenCodePort  int    `json:"opencode_port"`
+	CreatedAt     string `json:"created_at"`
 }
 
 type Repo struct {
@@ -66,6 +67,7 @@ Workflow:
 	rootCmd.AddCommand(checkpointCmd())
 	rootCmd.AddCommand(projectCmd())
 	rootCmd.AddCommand(sessionsCmd())
+	rootCmd.AddCommand(messagesCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -188,12 +190,16 @@ func initCmd() *cobra.Command {
 func startCmd() *cobra.Command {
 	var port int
 	var projectName string
+	var opencodePort int
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start orchestration daemon with one headless OpenCode",
-		Long: `Starts the orchestration daemon and ONE headless OpenCode instance.
-Sessions are created for each project repository.`,
+		Short: "Start orchestration daemon",
+		Long: `Starts the orchestration daemon and connects to existing OpenCode server.
+Sessions are created for each project repository.
+
+Make sure OpenCode is running before starting the daemon:
+  opencode serve --port 4096`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			stateDir, err := findProjectDir(projectName)
 			if err != nil {
@@ -221,27 +227,21 @@ Sessions are created for each project repository.`,
 				return err
 			}
 
-			// Create headless manager (single OpenCode instance)
+			// Connect to existing OpenCode server
 			hm := headless.NewManager()
 
-			// Start OpenCode on a separate port (9900 by default)
-			opencodePort := 9900
-			fmt.Printf("Starting headless OpenCode on port %d...\n", opencodePort)
-			if err := hm.Start(opencodePort); err != nil {
-				return fmt.Errorf("failed to start OpenCode: %w", err)
+			// Get credentials from environment
+			username := os.Getenv("OPENCODE_SERVER_USERNAME")
+			password := os.Getenv("OPENCODE_SERVER_PASSWORD")
+
+			if username != "" && password != "" {
+				err = hm.ConnectWithCredentials(opencodePort, username, password)
+			} else {
+				err = hm.Connect(opencodePort)
 			}
 
-			// Wait for OpenCode to be ready
-			fmt.Println("Waiting for OpenCode to be ready...")
-			for i := 0; i < 15; i++ {
-				if hm.IsRunning() {
-					break
-				}
-				time.Sleep(1 * time.Second)
-			}
-
-			if !hm.IsRunning() {
-				return fmt.Errorf("OpenCode failed to start")
+			if err != nil {
+				return fmt.Errorf("failed to connect to OpenCode: %w\n\nMake sure OpenCode is running:\n  opencode serve --port %d", err, opencodePort)
 			}
 
 			// Create sessions for each repo
@@ -267,7 +267,7 @@ Sessions are created for each project repository.`,
 			fmt.Printf("║  ORCHESTRATION DAEMON                           \n")
 			fmt.Printf("╠══════════════════════════════════════════════════╣\n")
 			fmt.Printf("║  Daemon:   http://localhost:%d\n", port)
-			fmt.Printf("║  OpenCode: http://localhost:%d (headless)\n", opencodePort)
+			fmt.Printf("║  OpenCode: http://localhost:%d (existing)\n", opencodePort)
 			fmt.Printf("║  Project:  %s\n", config.Project)
 			fmt.Printf("║                                                  \n")
 			fmt.Printf("║  Sessions:\n")
@@ -278,8 +278,8 @@ Sessions are created for each project repository.`,
 			fmt.Printf("║  Commands:\n")
 			fmt.Printf("║    crush-orchestrator send <repo> <message>\n")
 			fmt.Printf("║    crush-orchestrator sessions\n")
+			fmt.Printf("║    crush-orchestrator messages <repo>\n")
 			fmt.Printf("║    crush-orchestrator task create ...\n")
-			fmt.Printf("║    crush-orchestrator checkpoint list\n")
 			fmt.Printf("╚══════════════════════════════════════════════════╝\n")
 
 			pidFile := filepath.Join(stateDir, "daemon.pid")
@@ -291,7 +291,6 @@ Sessions are created for each project repository.`,
 			<-sigCh
 
 			fmt.Println("\nShutting down...")
-			hm.Stop()
 			d.Stop()
 			os.Remove(pidFile)
 			fmt.Println("✓ Stopped.")
@@ -302,6 +301,7 @@ Sessions are created for each project repository.`,
 
 	cmd.Flags().IntVarP(&port, "port", "p", 9800, "Daemon port")
 	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	cmd.Flags().IntVar(&opencodePort, "opencode-port", 4096, "OpenCode server port")
 
 	return cmd
 }
@@ -502,6 +502,64 @@ func sessionsCmd() *cobra.Command {
 			fmt.Printf("%-20s %-10s %-40s %s\n", "───────", "─────", "──", "────")
 			for _, s := range sessions {
 				fmt.Printf("%-20s %-10s %-40s %s\n", s.Name, s.Agent, s.ID, s.Path)
+			}
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	return cmd
+}
+
+func messagesCmd() *cobra.Command {
+	var projectName string
+
+	cmd := &cobra.Command{
+		Use:   "messages [session-name]",
+		Short: "Show messages from a session",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			sessionName := args[0]
+
+			stateDir, err := findProjectDir(projectName)
+			if err != nil {
+				return err
+			}
+
+			config, _ := loadConfig(stateDir)
+			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
+
+			url := fmt.Sprintf("http://localhost:%d/api/v1/messages/%s", config.Port, sessionName)
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("Authorization", "Bearer "+string(secret))
+
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("daemon not running")
+			}
+			defer resp.Body.Close()
+
+			var messages []struct {
+				ID      string    `json:"id"`
+				Role    string    `json:"role"`
+				Content string    `json:"content"`
+				Time    time.Time `json:"time"`
+				Error   string    `json:"error,omitempty"`
+			}
+			json.NewDecoder(resp.Body).Decode(&messages)
+
+			if len(messages) == 0 {
+				fmt.Println("No messages yet.")
+				return nil
+			}
+
+			fmt.Printf("Messages for %s:\n\n", sessionName)
+			for _, msg := range messages {
+				if msg.Error != "" {
+					fmt.Printf("[%s] ERROR: %s\n", msg.Role, msg.Error)
+				} else if msg.Content != "" {
+					fmt.Printf("[%s] %s\n", msg.Role, msg.Content)
+				}
 			}
 			return nil
 		},
