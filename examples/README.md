@@ -19,20 +19,20 @@ go build -o crush-orchestrator ./cmd/orchestrator/
 
 ### 2. Initialize orchestration workspace
 
-You can use either local paths or remote git URLs:
+You can use local paths, remote git URLs, or mix them:
 
-**Option A: Local repositories**
+**Option A: Local projects (git or non-git)**
 
 ```bash
 ./crush-orchestrator init my-project \
   --repos ~/code/api-gateway,~/code/user-service,~/code/notification-service
 ```
 
-**Option B: Remote repositories (will be cloned)**
+**Option B: Remote git repositories (will be cloned)**
 
 ```bash
 ./crush-orchestrator init my-project \
-  --repos git@github.com:yourorg/api-gateway.git,git@github.com:yourorg/user-service.git,git@github.com:yourorg/notification-service.git
+  --repos git@github.com:yourorg/api-gateway.git,git@github.com:yourorg/user-service.git
 ```
 
 **Option C: Mix of local and remote**
@@ -42,17 +42,24 @@ You can use either local paths or remote git URLs:
   --repos ~/code/api-gateway,git@github.com:yourorg/user-service.git
 ```
 
+**Non-git projects work too:**
+
+```bash
+./crush-orchestrator init my-project \
+  --repos ~/code/my-app,~/code/my-api
+```
+
 **Custom clone directory (for remote repos):**
 
 ```bash
 ./crush-orchestrator init my-project \
-  --repos git@github.com:yourorg/api-gateway.git \
+  --repos git@github.com:yourorg/repo.git \
   --clone-dir ~/cloned-repos
 ```
 
 This creates:
 - `.orchestrator/` directory with state files
-- `.opencode/` directories in each repo with plugin, tools, and agent configs
+- `.opencode/` directories in each project with plugin, tools, and agent configs
 - Remote repos cloned to `.orchestrator/repos/` (or `--clone-dir`)
 
 ### 4. Start orchestration

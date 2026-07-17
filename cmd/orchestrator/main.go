@@ -36,19 +36,22 @@ type Config struct {
 
 // Repo represents a repository configuration
 type Repo struct {
-	Name string `json:"name"`
-	Path string `json:"path"`
-	Port int    `json:"port"`
+	Name   string `json:"name"`
+	Path   string `json:"path"`
+	Port   int    `json:"port"`
+	IsGit  bool   `json:"is_git"`
 }
 
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "crush-orchestrator",
-		Short: "Orchestrate multiple OpenCode agents across repositories",
+		Short: "Orchestrate multiple OpenCode agents across projects",
 		Long: `Agent Team Orchestrator for OpenCode
 
-Coordinate multiple AI coding agents across different repositories
-through a central hub with shared workspace.`,
+Coordinate multiple AI coding agents across different projects
+through a central hub with shared workspace.
+
+Works with git repositories and non-git projects.`,
 		Version: fmt.Sprintf("%s (commit: %s)", version, commit),
 	}
 
@@ -73,11 +76,12 @@ func initCmd() *cobra.Command {
 		Short: "Initialize a new orchestration workspace",
 		Long: `Initialize a new orchestration workspace.
 
-Repositories can be specified as:
-  - Local paths: /path/to/repo, ~/code/repo
+Projects can be specified as:
+  - Local paths: /path/to/project, ~/code/project
   - Remote URLs: git@github.com:org/repo.git, https://github.com/org/repo.git
 
-Remote repositories will be cloned to the specified clone directory.`,
+Remote repositories will be cloned to the specified clone directory.
+Git is optional - works with any project directory.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			projectName := args[0]
@@ -95,7 +99,7 @@ Remote repositories will be cloned to the specified clone directory.`,
 
 			// Validate repos
 			if len(repos) == 0 {
-				return fmt.Errorf("at least one repository required (--repos)")
+				return fmt.Errorf("at least one project required (--repos)")
 			}
 
 			// Create clone directory if needed
@@ -107,9 +111,10 @@ Remote repositories will be cloned to the specified clone directory.`,
 			for i, repoRef := range repos {
 				var absPath string
 				var repoName string
+				var isGit bool
 
 				if isRemoteURL(repoRef) {
-					// Clone remote repository
+					// Remote URLs must be git
 					repoName = extractRepoName(repoRef)
 					clonePath := filepath.Join(cloneDir, repoName)
 
@@ -119,6 +124,7 @@ Remote repositories will be cloned to the specified clone directory.`,
 					}
 
 					absPath = clonePath
+					isGit = true
 				} else {
 					// Local path
 					var err error
@@ -130,25 +136,28 @@ Remote repositories will be cloned to the specified clone directory.`,
 					// Check directory exists
 					info, err := os.Stat(absPath)
 					if err != nil {
-						return fmt.Errorf("repository not found: %s", absPath)
+						return fmt.Errorf("project not found: %s", absPath)
 					}
 					if !info.IsDir() {
 						return fmt.Errorf("not a directory: %s", absPath)
 					}
 
 					repoName = filepath.Base(absPath)
-				}
 
-				// Check if git repo
-				gitDir := filepath.Join(absPath, ".git")
-				if _, err := os.Stat(gitDir); err != nil {
-					return fmt.Errorf("not a git repository: %s", absPath)
+					// Check if git repo (optional)
+					gitDir := filepath.Join(absPath, ".git")
+					if _, err := os.Stat(gitDir); err == nil {
+						isGit = true
+					} else {
+						fmt.Printf("  Note: %s is not a git repository (git features disabled)\n", repoName)
+					}
 				}
 
 				repoConfigs = append(repoConfigs, Repo{
-					Name: repoName,
-					Path: absPath,
-					Port: 9801 + i,
+					Name:  repoName,
+					Path:  absPath,
+					Port:  9801 + i,
+					IsGit: isGit,
 				})
 			}
 
@@ -205,9 +214,13 @@ Remote repositories will be cloned to the specified clone directory.`,
 			}
 
 			fmt.Printf("✓ Workspace initialized: %s\n", projectName)
-			fmt.Printf("  Repositories:\n")
+			fmt.Printf("  Projects:\n")
 			for _, repo := range repoConfigs {
-				fmt.Printf("    - %s (%s, port %d)\n", repo.Name, repo.Path, repo.Port)
+				gitStatus := ""
+				if !repo.IsGit {
+					gitStatus = " (no git)"
+				}
+				fmt.Printf("    - %s (port %d)%s\n", repo.Name, repo.Port, gitStatus)
 			}
 			fmt.Printf("  State: %s\n", stateDir)
 			fmt.Printf("\nRun 'crush-orchestrator start' to begin.\n")
@@ -216,7 +229,7 @@ Remote repositories will be cloned to the specified clone directory.`,
 		},
 	}
 
-	cmd.Flags().StringSliceVar(&repos, "repos", nil, "Repository paths or git URLs (required)")
+	cmd.Flags().StringSliceVar(&repos, "repos", nil, "Project paths or git URLs (required)")
 	cmd.MarkFlagRequired("repos")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing workspace")
 	cmd.Flags().StringVar(&cloneDir, "clone-dir", "", "Directory to clone remote repos (default: .orchestrator/repos)")
