@@ -1,0 +1,564 @@
+openapi: 3.0.0
+info:
+  title: Orchestration API
+  description: API for communication between Go wrapper and OpenCode TS plugin
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:9800
+    description: Local orchestration server
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Shared secret from .orchestrator/auth.key
+
+  schemas:
+    Task:
+      type: object
+      required: [id, title, description, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        description:
+          type: string
+        type:
+          type: string
+          enum: [feature, bugfix, refactor, docs, test, chore]
+        priority:
+          type: string
+          enum: [critical, high, medium, low]
+        status:
+          type: string
+          enum: [pending, assigned, in_progress, blocked, review, completed, cancelled]
+        assignee:
+          type: string
+        creator:
+          type: string
+        dependencies:
+          type: array
+          items:
+            $ref: '#/components/schemas/Dependency'
+        repo:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+
+    Dependency:
+      type: object
+      required: [task_id, type]
+      properties:
+        task_id:
+          type: string
+        type:
+          type: string
+          enum: [blocks, depends_on]
+
+    Message:
+      type: object
+      required: [id, from, to, type, content]
+      properties:
+        id:
+          type: string
+          format: uuid
+        from:
+          type: string
+        to:
+          type: string
+        type:
+          type: string
+          enum: [status_update, question, dependency_alert, task_assignment, blocker]
+        content:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    Checkpoint:
+      type: object
+      required: [id, type, description, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [pre_commit, pre_push, schema_change, breaking_change, destructive]
+        description:
+          type: string
+        status:
+          type: string
+          enum: [pending, approved, denied, timed_out]
+        affected_repos:
+          type: array
+          items:
+            type: string
+        reason:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        resolved_at:
+          type: string
+          format: date-time
+
+    Agent:
+      type: object
+      required: [id, type, status]
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        repo:
+          type: string
+        status:
+          type: string
+          enum: [active, idle, busy, failed]
+
+    Status:
+      type: object
+      properties:
+        running:
+          type: boolean
+        repos:
+          type: array
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+              port:
+                type: integer
+              status:
+                type: string
+        agents:
+          type: array
+          items:
+            $ref: '#/components/schemas/Agent'
+        stats:
+          type: object
+          properties:
+            active_tasks:
+              type: integer
+            completed_tasks:
+              type: integer
+            pending_checkpoints:
+              type: integer
+            total_messages:
+              type: integer
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        uptime:
+          type: string
+        version:
+          type: string
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        details:
+          type: string
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /api/v1/status:
+    get:
+      summary: Get orchestration status
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Status'
+
+  /api/v1/tasks:
+    post:
+      summary: Create a task
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title, description, creator]
+              properties:
+                title:
+                  type: string
+                description:
+                  type: string
+                type:
+                  type: string
+                  enum: [feature, bugfix, refactor, docs, test, chore]
+                priority:
+                  type: string
+                  enum: [critical, high, medium, low]
+                assignee:
+                  type: string
+                creator:
+                  type: string
+                dependencies:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/Dependency'
+                repo:
+                  type: string
+      responses:
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Dependency conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      summary: List tasks
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, assigned, in_progress, blocked, review, completed, cancelled]
+        - name: assignee
+          in: query
+          schema:
+            type: string
+        - name: repo
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Tasks
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Task'
+
+  /api/v1/tasks/{id}:
+    get:
+      summary: Get task by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    patch:
+      summary: Update task
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                status:
+                  type: string
+                  enum: [pending, assigned, in_progress, blocked, review, completed, cancelled]
+                assignee:
+                  type: string
+                priority:
+                  type: string
+                  enum: [critical, high, medium, low]
+      responses:
+        '200':
+          description: Updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Task'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/messages:
+    post:
+      summary: Send a message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, type, content]
+              properties:
+                from:
+                  type: string
+                to:
+                  type: string
+                  description: Agent ID or "all" for broadcast
+                type:
+                  type: string
+                  enum: [status_update, question, dependency_alert, task_assignment, blocker]
+                content:
+                  type: string
+                  maxLength: 10240
+      responses:
+        '201':
+          description: Message sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Recipient not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/messages/{agent_id}:
+    get:
+      summary: Get agent inbox
+      parameters:
+        - name: agent_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: ack
+          in: query
+          description: Acknowledge messages after reading
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Messages
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Message'
+
+  /api/v1/checkpoints:
+    post:
+      summary: Create checkpoint
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, description, requester]
+              properties:
+                type:
+                  type: string
+                  enum: [pre_commit, pre_push, schema_change, breaking_change, destructive]
+                description:
+                  type: string
+                requester:
+                  type: string
+                affected_repos:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Checkpoint created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '400':
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      summary: List pending checkpoints
+      responses:
+        '200':
+          description: Checkpoints
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Checkpoint'
+
+  /api/v1/checkpoints/{id}/approve:
+    post:
+      summary: Approve checkpoint
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Approved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Already resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/checkpoints/{id}/deny:
+    post:
+      summary: Deny checkpoint
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                reason:
+                  type: string
+      responses:
+        '200':
+          description: Denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Checkpoint'
+        '404':
+          description: Not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Already resolved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/v1/agents:
+    post:
+      summary: Register agent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, type, repo]
+              properties:
+                id:
+                  type: string
+                type:
+                  type: string
+                repo:
+                  type: string
+      responses:
+        '201':
+          description: Agent registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Agent'
+
+    get:
+      summary: List agents
+      responses:
+        '200':
+          description: Agents
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Agent'

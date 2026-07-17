@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yourusername/agent-team-orchestration/pkg/types"
+	"github.com/rhony08/agent-team-orchestration/pkg/types"
 )
 
 // Manager handles workspace operations

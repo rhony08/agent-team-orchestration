@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["./.opencode/plugins/orchestration.ts"],
+  "agent": {
+    "tech-lead": {
+      "description": "Coordinates multi-repo development, decomposes tasks, manages dependencies",
+      "mode": "primary",
+      "prompt": "{file:./.opencode/agents/tech-lead.md}"
+    },
+    "backend-dev": {
+      "description": "Specialized backend development across microservices",
+      "mode": "subagent",
+      "prompt": "{file:./.opencode/agents/backend-dev.md}"
+    },
+    "frontend-dev": {
+      "description": "Specialized frontend/UI development",
+      "mode": "subagent",
+      "prompt": "{file:./.opencode/agents/frontend-dev.md}"
+    }
+  }
+}

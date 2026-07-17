@@ -1,13 +1,22 @@
 // cmd/orchestrator/main.go
-// Main entry point for the orchestrator CLI
-
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/rhony08/agent-team-orchestration/pkg/api"
+	"github.com/rhony08/agent-team-orchestration/pkg/process"
+	"github.com/rhony08/agent-team-orchestration/pkg/state"
 )
 
 var (
@@ -15,25 +24,37 @@ var (
 	commit  = "dev"
 )
 
+// Config represents the orchestration config
+type Config struct {
+	Version    string   `json:"version"`
+	Project    string   `json:"project"`
+	Repos      []Repo   `json:"repos"`
+	AuthSecret string   `json:"-"`
+	CreatedAt  string   `json:"created_at"`
+}
+
+// Repo represents a repository configuration
+type Repo struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+	Port int    `json:"port"`
+}
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "crush-orchestrator",
-		Short: "Orchestrate multiple OpenCode/Crush agents",
-		Long: `Agent Team Orchestrator for OpenCode/Crush
+		Short: "Orchestrate multiple OpenCode agents across repositories",
+		Long: `Agent Team Orchestrator for OpenCode
 
-Enable multiple AI coding agents to coordinate across different repositories
+Coordinate multiple AI coding agents across different repositories
 through a central hub with shared workspace.`,
 		Version: fmt.Sprintf("%s (commit: %s)", version, commit),
 	}
 
-	// Add subcommands
-	rootCmd.AddCommand(initWorkspaceCmd())
-	rootCmd.AddCommand(addAgentCmd())
+	rootCmd.AddCommand(initCmd())
 	rootCmd.AddCommand(startCmd())
 	rootCmd.AddCommand(stopCmd())
 	rootCmd.AddCommand(statusCmd())
-	rootCmd.AddCommand(dashboardCmd())
-	rootCmd.AddCommand(messageCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -41,69 +62,216 @@ through a central hub with shared workspace.`,
 	}
 }
 
-func initWorkspaceCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "init-workspace [name]",
-		Short: "Initialize a new orchestrator workspace",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
-			fmt.Printf("Initializing workspace: %s\n", name)
-			// TODO: Implement workspace initialization
-			return nil
-		},
-	}
-}
-
-func addAgentCmd() *cobra.Command {
-	var (
-		role  string
-		repo  string
-		model string
-	)
+func initCmd() *cobra.Command {
+	var repos []string
+	var force bool
 
 	cmd := &cobra.Command{
-		Use:   "add-agent",
-		Short: "Add a new agent to the workspace",
+		Use:   "init [project-name]",
+		Short: "Initialize a new orchestration workspace",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("Adding agent:\n")
-			fmt.Printf("  Role: %s\n", role)
-			fmt.Printf("  Repo: %s\n", repo)
-			fmt.Printf("  Model: %s\n", model)
-			// TODO: Implement agent addition
+			projectName := args[0]
+			stateDir := ".orchestrator"
+
+			// Check if already exists
+			if _, err := os.Stat(stateDir); err == nil && !force {
+				return fmt.Errorf("workspace already exists. Use --force to overwrite")
+			}
+
+			// Validate project name
+			if strings.ContainsAny(projectName, " \t\n") {
+				return fmt.Errorf("project name must not contain spaces")
+			}
+
+			// Validate repos
+			if len(repos) == 0 {
+				return fmt.Errorf("at least one repository required (--repos)")
+			}
+
+			var repoConfigs []Repo
+			for i, repoPath := range repos {
+				absPath, err := filepath.Abs(repoPath)
+				if err != nil {
+					return fmt.Errorf("invalid path %s: %w", repoPath, err)
+				}
+
+				// Check directory exists
+				info, err := os.Stat(absPath)
+				if err != nil {
+					return fmt.Errorf("repository not found: %s", absPath)
+				}
+				if !info.IsDir() {
+					return fmt.Errorf("not a directory: %s", absPath)
+				}
+
+				// Check if git repo
+				gitDir := filepath.Join(absPath, ".git")
+				if _, err := os.Stat(gitDir); err != nil {
+					return fmt.Errorf("not a git repository: %s", absPath)
+				}
+
+				name := filepath.Base(absPath)
+				repoConfigs = append(repoConfigs, Repo{
+					Name: name,
+					Path: absPath,
+					Port: 9801 + i,
+				})
+			}
+
+			// Generate auth secret
+			secret := generateSecret()
+
+			// Create config
+			config := Config{
+				Version:    "1.0.0",
+				Project:    projectName,
+				Repos:      repoConfigs,
+				AuthSecret: secret,
+				CreatedAt:  time.Now().Format(time.RFC3339),
+			}
+
+			// Create state directory structure
+			dirs := []string{
+				"tasks/active",
+				"tasks/completed",
+				"messages/inbox",
+				"messages/archive",
+				"checkpoints/pending",
+				"checkpoints/resolved",
+				"agents",
+			}
+
+			if err := os.RemoveAll(stateDir); err != nil && !force {
+				return err
+			}
+
+			for _, dir := range dirs {
+				path := filepath.Join(stateDir, dir)
+				if err := os.MkdirAll(path, 0755); err != nil {
+					return fmt.Errorf("failed to create %s: %w", dir, err)
+				}
+			}
+
+			// Write config
+			configData, _ := json.MarshalIndent(config, "", "  ")
+			if err := os.WriteFile(filepath.Join(stateDir, "config.json"), configData, 0644); err != nil {
+				return err
+			}
+
+			// Write auth secret
+			if err := os.WriteFile(filepath.Join(stateDir, "auth.key"), []byte(secret), 0600); err != nil {
+				return err
+			}
+
+			// Copy plugin files to each repo
+			for _, repo := range repoConfigs {
+				if err := setupRepoPlugins(repo.Path, secret); err != nil {
+					fmt.Printf("Warning: Failed to setup plugins in %s: %v\n", repo.Name, err)
+				}
+			}
+
+			fmt.Printf("✓ Workspace initialized: %s\n", projectName)
+			fmt.Printf("  Repositories:\n")
+			for _, repo := range repoConfigs {
+				fmt.Printf("    - %s (port %d)\n", repo.Name, repo.Port)
+			}
+			fmt.Printf("  State: %s\n", stateDir)
+			fmt.Printf("\nRun 'crush-orchestrator start' to begin.\n")
+
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&role, "role", "backend-dev", "Agent role template")
-	cmd.Flags().StringVar(&repo, "repo", "", "Repository path (required)")
-	cmd.Flags().StringVar(&model, "model", "claude-3.7-sonnet", "AI model to use")
-	cmd.MarkFlagRequired("repo")
+	cmd.Flags().StringSliceVar(&repos, "repos", nil, "Repository paths (required)")
+	cmd.MarkFlagRequired("repos")
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing workspace")
 
 	return cmd
 }
 
 func startCmd() *cobra.Command {
-	var (
-		workspace string
-		port      int
-	)
+	var port int
 
 	cmd := &cobra.Command{
 		Use:   "start",
-		Short: "Start the orchestrator server",
+		Short: "Start the orchestration server and agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("Starting orchestrator server...\n")
-			fmt.Printf("  Workspace: %s\n", workspace)
-			fmt.Printf("  Port: %d\n", port)
-			// TODO: Implement server startup
+			stateDir := ".orchestrator"
+
+			// Load config
+			config, err := loadConfig(stateDir)
+			if err != nil {
+				return fmt.Errorf("failed to load config. Run 'crush-orchestrator init' first: %w", err)
+			}
+
+			// Read auth secret
+			secretBytes, err := os.ReadFile(filepath.Join(stateDir, "auth.key"))
+			if err != nil {
+				return fmt.Errorf("failed to read auth key: %w", err)
+			}
+			secret := string(secretBytes)
+
+			// Initialize state manager
+			stateManager, err := state.NewManager(stateDir)
+			if err != nil {
+				return fmt.Errorf("failed to initialize state: %w", err)
+			}
+
+			// Start HTTP API server
+			apiServer := api.NewServer(stateManager, port, secret)
+			if err := apiServer.Start(); err != nil {
+				return fmt.Errorf("failed to start API server: %w", err)
+			}
+			fmt.Printf("✓ API server started on port %d\n", port)
+
+			// Start process manager
+			procManager := process.NewManager(9801)
+
+			// Start OpenCode instances
+			for _, repo := range config.Repos {
+				fmt.Printf("  Starting OpenCode in %s (port %d)...\n", repo.Name, repo.Port)
+				if err := procManager.Spawn(repo.Name, repo.Path, repo.Port); err != nil {
+					fmt.Printf("  ⚠ Failed to start %s: %v\n", repo.Name, err)
+				}
+			}
+
+			// Wait for processes to be ready
+			fmt.Println("\nWaiting for agents to be ready...")
+			time.Sleep(5 * time.Second)
+
+			// Show status
+			health := procManager.HealthCheck()
+			for name, status := range health {
+				symbol := "✓"
+				if status != "healthy" {
+					symbol = "✗"
+				}
+				fmt.Printf("  %s %s: %s\n", symbol, name, status)
+			}
+
+			// Write PID files
+			procManager.WritePIDFiles(stateDir)
+
+			fmt.Printf("\n✓ Orchestration started. API at http://localhost:%d\n", port)
+			fmt.Println("Press Ctrl+C to stop.")
+
+			// Wait for shutdown signal
+			sigCh := make(chan os.Signal, 1)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			<-sigCh
+
+			fmt.Println("\nShutting down...")
+			procManager.StopAll()
+			apiServer.Stop()
+			procManager.CleanupPIDFiles(stateDir)
+			fmt.Println("✓ Stopped.")
+
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVarP(&workspace, "workspace", "w", "", "Workspace name")
-	cmd.Flags().IntVarP(&port, "port", "p", 8080, "Server port")
-	cmd.MarkFlagRequired("workspace")
+	cmd.Flags().IntVarP(&port, "port", "p", 9800, "API server port")
 
 	return cmd
 }
@@ -111,10 +279,40 @@ func startCmd() *cobra.Command {
 func stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
-		Short: "Stop the orchestrator server",
+		Short: "Stop the orchestration server and agents",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("Stopping orchestrator...")
-			// TODO: Implement graceful shutdown
+			stateDir := ".orchestrator"
+			pidDir := filepath.Join(stateDir, "pids")
+
+			entries, err := os.ReadDir(pidDir)
+			if err != nil {
+				return fmt.Errorf("not running (no PID files found)")
+			}
+
+			for _, entry := range entries {
+				if entry.IsDir() {
+					continue
+				}
+
+				name := strings.TrimSuffix(entry.Name(), ".pid")
+				pidData, err := os.ReadFile(filepath.Join(pidDir, entry.Name()))
+				if err != nil {
+					continue
+				}
+
+				var pid int
+				fmt.Sscanf(string(pidData), "%d", &pid)
+
+				if process, err := os.FindProcess(pid); err == nil {
+					process.Signal(syscall.SIGTERM)
+					fmt.Printf("  Sent SIGTERM to %s (PID %d)\n", name, pid)
+				}
+			}
+
+			// Cleanup PID files
+			os.RemoveAll(pidDir)
+			fmt.Println("✓ Stopped.")
+
 			return nil
 		},
 	}
@@ -123,50 +321,227 @@ func stopCmd() *cobra.Command {
 func statusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show orchestrator status",
+		Short: "Show orchestration status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("Orchestrator Status:")
-			fmt.Println("  Status: Running")
-			fmt.Println("  Agents: 3 active")
-			fmt.Println("  Tasks: 2 in progress, 1 pending")
-			// TODO: Implement status reporting
+			stateDir := ".orchestrator"
+
+			// Check if running
+			pidDir := filepath.Join(stateDir, "pids")
+			if _, err := os.Stat(pidDir); os.IsNotExist(err) {
+				fmt.Println("Not running. Run 'crush-orchestrator start' to begin.")
+				return nil
+			}
+
+			// Load config
+			config, err := loadConfig(stateDir)
+			if err != nil {
+				return err
+			}
+
+			// Load state summary
+			summaryData, err := os.ReadFile(filepath.Join(stateDir, "state.json"))
+			if err == nil {
+				var summary state.Summary
+				json.Unmarshal(summaryData, &summary)
+
+				fmt.Printf("Project: %s\n", config.Project)
+				fmt.Printf("Status: Running\n")
+				fmt.Printf("\nRepositories:\n")
+				for _, repo := range config.Repos {
+					fmt.Printf("  - %s (port %d)\n", repo.Name, repo.Port)
+				}
+				fmt.Printf("\nStatistics:\n")
+				fmt.Printf("  Active tasks: %d\n", summary.Stats.ActiveTasks)
+				fmt.Printf("  Completed tasks: %d\n", summary.Stats.CompletedTasks)
+				fmt.Printf("  Pending checkpoints: %d\n", summary.Stats.PendingCheckpoints)
+				fmt.Printf("  Registered agents: %d\n", summary.Stats.TotalAgents)
+			} else {
+				fmt.Printf("Project: %s\n", config.Project)
+				fmt.Printf("Status: Running (no state yet)\n")
+			}
+
 			return nil
 		},
 	}
 }
 
-func dashboardCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "dashboard",
-		Short: "Open the TUI dashboard",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("Launching dashboard...")
-			// TODO: Launch Bubble Tea TUI
-			return nil
-		},
-	}
+// --- Helpers ---
+
+func generateSecret() string {
+	bytes := make([]byte, 32)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
 }
 
-func messageCmd() *cobra.Command {
-	var (
-		to      string
-		message string
-	)
-
-	cmd := &cobra.Command{
-		Use:   "message",
-		Short: "Send a message to an agent",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Printf("Sending message to %s: %s\n", to, message)
-			// TODO: Implement messaging
-			return nil
-		},
+func loadConfig(stateDir string) (*Config, error) {
+	data, err := os.ReadFile(filepath.Join(stateDir, "config.json"))
+	if err != nil {
+		return nil, err
 	}
 
-	cmd.Flags().StringVarP(&to, "to", "t", "", "Recipient agent ID")
-	cmd.Flags().StringVarP(&message, "message", "m", "", "Message content")
-	cmd.MarkFlagRequired("to")
-	cmd.MarkFlagRequired("message")
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, err
+	}
 
-	return cmd
+	return &config, nil
+}
+
+func setupRepoPlugins(repoPath, secret string) error {
+	opencodeDir := filepath.Join(repoPath, ".opencode")
+	pluginsDir := filepath.Join(opencodeDir, "plugins")
+	toolsDir := filepath.Join(opencodeDir, "tools")
+	agentsDir := filepath.Join(opencodeDir, "agents")
+
+	// Create directories
+	for _, dir := range []string{pluginsDir, toolsDir, agentsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+
+	// Write plugin file
+	pluginContent := getPluginContent(secret)
+	if err := os.WriteFile(filepath.Join(pluginsDir, "orchestration.ts"), []byte(pluginContent), 0644); err != nil {
+		return err
+	}
+
+	// Write agent configs
+	if err := writeAgentConfigs(agentsDir); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func getPluginContent(secret string) string {
+	return `// Orchestration Plugin
+// Auto-generated by crush-orchestrator
+import type { Plugin } from "@opencode-ai/plugin"
+
+const API_URL = "http://localhost:9800"
+const SECRET = "` + secret + `"
+
+async function apiCall(path: string, method: string = "GET", body?: any) {
+  const url = API_URL + path
+  const res = await fetch(url, {
+    method,
+    headers: {
+      "Authorization": "Bearer " + SECRET,
+      "Content-Type": "application/json",
+    },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) throw new Error("API error: " + res.status)
+  return res.json()
+}
+
+export const OrchestrationPlugin: Plugin = async ({ project, client, $, directory }) => {
+  return {
+    "session.created": async () => {
+      try {
+        await apiCall("/health")
+        await client.app.log({
+          body: { service: "orchestration", level: "info", message: "Connected to orchestrator" },
+        })
+      } catch (e) {
+        console.warn("Orchestrator not available, running in standalone mode")
+      }
+    },
+
+    "session.idle": async () => {
+      try {
+        // Check for pending messages
+        // This will be handled by custom tools
+      } catch (e) {
+        // Ignore errors
+      }
+    },
+  }
+}
+`
+}
+
+func writeAgentConfigs(agentsDir string) error {
+	configs := map[string]string{
+		"tech-lead.md": `---
+description: Coordinates multi-repo development, decomposes tasks, manages dependencies
+mode: primary
+permission:
+  edit: ask
+  bash:
+    "*": ask
+    "git status*": allow
+    "git log*": allow
+    "ls*": allow
+---
+
+You are a Tech Lead coordinating a multi-repository development effort.
+
+## Responsibilities
+1. Analyze the project scope and break it into tasks
+2. Identify dependencies between repositories
+3. Assign tasks to specialized agents (backend-dev, frontend-dev)
+4. Monitor progress and resolve blockers
+5. Ensure architectural consistency across repos
+
+## Rules
+- Never commit without a checkpoint
+- Always check dependencies before starting work
+- Document architectural decisions
+`,
+		"backend-dev.md": `---
+description: Specialized backend development across microservices
+mode: subagent
+permission:
+  edit: allow
+  bash:
+    "*": ask
+    "git add*": allow
+    "git commit*": ask
+    "go test*": allow
+    "npm test*": allow
+---
+
+You are a Backend Developer working on microservices.
+
+## Capabilities
+- API design and implementation
+- Database schema changes
+- Business logic implementation
+- Unit and integration testing
+
+## Rules
+- Always check API contracts before changing interfaces
+- Coordinate database changes with other services
+- Include test coverage for new functionality
+`,
+		"frontend-dev.md": `---
+description: Specialized frontend/UI development
+mode: subagent
+permission:
+  edit: allow
+  bash:
+    "*": ask
+    "npm test*": allow
+    "npm run build*": allow
+---
+
+You are a Frontend Developer working on UI components.
+
+## Rules
+- Follow existing design system patterns
+- Ensure accessibility (WCAG 2.1 AA)
+- Coordinate API contracts with backend agents
+`,
+	}
+
+	for name, content := range configs {
+		path := filepath.Join(agentsDir, name)
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
