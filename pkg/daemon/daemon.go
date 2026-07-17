@@ -1,7 +1,10 @@
 package daemon
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"sync"
@@ -21,7 +24,11 @@ type Daemon struct {
 	startTime  time.Time
 	httpServer *http.Server
 
-	// Connected OpenCode instances
+	// Instance registry (name -> port mapping)
+	instancePorts map[string]int
+	portMu        sync.RWMutex
+
+	// Connected instances (registered via API)
 	instances map[string]*Instance
 	instMu    sync.RWMutex
 
@@ -32,26 +39,18 @@ type Daemon struct {
 
 // Instance represents a connected OpenCode instance
 type Instance struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Path      string    `json:"path"`
-	Port      int       `json:"port"`
-	Agent     string    `json:"agent"`
-	Status    string    `json:"status"`
-	LastSeen  time.Time `json:"last_seen"`
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Path     string    `json:"path"`
+	Port     int       `json:"port"`
+	Status   string    `json:"status"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 // CheckpointResult holds the user's decision
 type CheckpointResult struct {
 	Approved bool
 	Reason   string
-}
-
-// Config holds daemon configuration
-type Config struct {
-	Port       int    `json:"port"`
-	AuthSecret string `json:"auth_secret"`
-	StateDir   string `json:"state_dir"`
 }
 
 // New creates a new daemon
@@ -61,17 +60,25 @@ func New(stateManager *state.Manager, port int, authSecret string) *Daemon {
 	router.Use(gin.Recovery())
 
 	d := &Daemon{
-		router:     router,
-		state:      stateManager,
-		port:       port,
-		authSecret: authSecret,
-		startTime:  time.Now(),
-		instances:  make(map[string]*Instance),
-		cpHandlers: make(map[string]chan CheckpointResult),
+		router:        router,
+		state:         stateManager,
+		port:          port,
+		authSecret:    authSecret,
+		startTime:     time.Now(),
+		instancePorts: make(map[string]int),
+		instances:     make(map[string]*Instance),
+		cpHandlers:    make(map[string]chan CheckpointResult),
 	}
 
 	d.setupRoutes()
 	return d
+}
+
+// RegisterInstancePort registers the port for an instance
+func (d *Daemon) RegisterInstancePort(name string, port int) {
+	d.portMu.Lock()
+	defer d.portMu.Unlock()
+	d.instancePorts[name] = port
 }
 
 func (d *Daemon) setupRoutes() {
@@ -82,6 +89,9 @@ func (d *Daemon) setupRoutes() {
 	d.router.POST("/api/v1/instances/register", d.authMiddleware(), d.registerInstance)
 	d.router.POST("/api/v1/instances/:id/heartbeat", d.authMiddleware(), d.heartbeat)
 	d.router.GET("/api/v1/instances", d.authMiddleware(), d.listInstances)
+
+	// Send message to instance
+	d.router.POST("/api/v1/send", d.authMiddleware(), d.sendToInstance)
 
 	// Tasks
 	d.router.POST("/api/v1/tasks", d.authMiddleware(), d.createTask)
@@ -155,16 +165,15 @@ func (d *Daemon) healthHandler(c *gin.Context) {
 		"status":    "ok",
 		"uptime":    time.Since(d.startTime).String(),
 		"version":   "1.0.0",
-		"instances": len(d.instances),
+		"instances": len(d.instancePorts),
 	})
 }
 
 func (d *Daemon) registerInstance(c *gin.Context) {
 	var req struct {
-		Name  string `json:"name" binding:"required"`
-		Path  string `json:"path" binding:"required"`
-		Port  int    `json:"port"`
-		Agent string `json:"agent"`
+		Name string `json:"name" binding:"required"`
+		Path string `json:"path" binding:"required"`
+		Port int    `json:"port"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -178,7 +187,6 @@ func (d *Daemon) registerInstance(c *gin.Context) {
 		Name:     req.Name,
 		Path:     req.Path,
 		Port:     req.Port,
-		Agent:    req.Agent,
 		Status:   "connected",
 		LastSeen: time.Now(),
 	}
@@ -187,15 +195,12 @@ func (d *Daemon) registerInstance(c *gin.Context) {
 	d.instances[id] = instance
 	d.instMu.Unlock()
 
-	// Also register in state
-	d.state.RegisterAgent(&state.Agent{
-		ID:     id,
-		Type:   req.Agent,
-		Repo:   req.Name,
-		Status: state.AgentStatusActive,
-	})
+	// Register port mapping
+	if req.Port > 0 {
+		d.RegisterInstancePort(req.Name, req.Port)
+	}
 
-	log.Printf("Instance connected: %s (%s) from %s", req.Name, req.Agent, req.Path)
+	log.Printf("Instance connected: %s from %s (port %d)", req.Name, req.Path, req.Port)
 
 	c.JSON(http.StatusOK, gin.H{
 		"instance_id": id,
@@ -227,26 +232,158 @@ func (d *Daemon) listInstances(c *gin.Context) {
 	c.JSON(http.StatusOK, instances)
 }
 
+func (d *Daemon) sendToInstance(c *gin.Context) {
+	var req struct {
+		Instance string `json:"instance" binding:"required"`
+		Message  string `json:"message" binding:"required"`
+		Agent    string `json:"agent"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Find instance port
+	d.portMu.RLock()
+	port, exists := d.instancePorts[req.Instance]
+	d.portMu.RUnlock()
+
+	if !exists {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("instance not found: %s", req.Instance)})
+		return
+	}
+
+	// Send to OpenCode instance
+	agentType := req.Agent
+	if agentType == "" {
+		agentType = "build" // default agent
+	}
+
+	response, err := d.forwardToOpenCode(port, agentType, req.Message)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("failed to send to %s: %v", req.Instance, err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"instance": req.Instance,
+		"response": response,
+	})
+}
+
+// forwardToOpenCode sends a message to an OpenCode instance
+func (d *Daemon) forwardToOpenCode(port int, agent, message string) (string, error) {
+	// Create session
+	sessionID, err := d.createOpenCodeSession(port, agent)
+	if err != nil {
+		return "", fmt.Errorf("failed to create session: %w", err)
+	}
+
+	// Send prompt
+	response, err := d.sendOpenCodePrompt(port, sessionID, message)
+	if err != nil {
+		return "", fmt.Errorf("failed to send prompt: %w", err)
+	}
+
+	return response, nil
+}
+
+// createOpenCodeSession creates a session in an OpenCode instance
+func (d *Daemon) createOpenCodeSession(port int, agent string) (string, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/session.create", port)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"agent": agent,
+	})
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+
+	return result.ID, nil
+}
+
+// sendOpenCodePrompt sends a prompt to an OpenCode session
+func (d *Daemon) sendOpenCodePrompt(port int, sessionID, prompt string) (string, error) {
+	url := fmt.Sprintf("http://127.0.0.1:%d/session.prompt", port)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"sessionID": sessionID,
+		"parts": []map[string]string{
+			{"type": "text", "text": prompt},
+		},
+	})
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		// Try alternative response format
+		var altResult struct {
+			Text string `json:"text"`
+		}
+		if err2 := json.NewDecoder(resp.Body).Decode(&altResult); err2 != nil {
+			return "Message sent (no response)", nil
+		}
+		return altResult.Text, nil
+	}
+
+	return result.Content, nil
+}
+
 func (d *Daemon) statusHandler(c *gin.Context) {
 	summary, _ := d.state.GetSummary()
 
-	d.instMu.RLock()
-	instances := make([]gin.H, 0, len(d.instances))
-	for _, inst := range d.instances {
-		instances = append(instances, gin.H{
-			"id":      inst.ID,
-			"name":    inst.Name,
-			"agent":   inst.Agent,
-			"status":  inst.Status,
-			"path":    inst.Path,
+	// Get instance statuses
+	d.portMu.RLock()
+	instanceStatuses := make([]gin.H, 0)
+	for name, port := range d.instancePorts {
+		status := "unknown"
+		client := &http.Client{Timeout: 1 * time.Second}
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+		if err == nil && resp.StatusCode == 200 {
+			status = "running"
+		} else {
+			status = "unreachable"
+		}
+		instanceStatuses = append(instanceStatuses, gin.H{
+			"name":   name,
+			"port":   port,
+			"status": status,
 		})
 	}
-	d.instMu.RUnlock()
+	d.portMu.RUnlock()
 
 	c.JSON(http.StatusOK, gin.H{
 		"running":   true,
 		"uptime":    time.Since(d.startTime).String(),
-		"instances": instances,
+		"instances": instanceStatuses,
 		"stats":     summary.Stats,
 	})
 }
@@ -283,10 +420,6 @@ func (d *Daemon) createTask(c *gin.Context) {
 	}
 
 	if err := d.state.CreateTask(task); err != nil {
-		if err.Error() == "circular dependency detected" {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			return
-		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -360,11 +493,6 @@ func (d *Daemon) sendMessage(c *gin.Context) {
 		return
 	}
 
-	if len(req.Content) > 10240 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Content too large (max 10KB)"})
-		return
-	}
-
 	msg := &state.Message{
 		ID:        uuid.New().String(),
 		From:      req.From,
@@ -427,19 +555,16 @@ func (d *Daemon) createCheckpoint(c *gin.Context) {
 		return
 	}
 
-	// Log checkpoint for terminal display
+	// Display checkpoint in terminal
 	fmt.Printf("\n╔══════════════════════════════════════════════════╗\n")
 	fmt.Printf("║  CHECKPOINT REQUEST                             \n")
 	fmt.Printf("╠══════════════════════════════════════════════════╣\n")
 	fmt.Printf("║  From: %-42s\n", req.Requester)
 	fmt.Printf("║  Type: %-42s\n", req.Type)
 	fmt.Printf("║  %s\n", req.Description)
-	if len(req.AffectedRepos) > 0 {
-		fmt.Printf("║  Repos: %s\n", joinStrings(req.AffectedRepos, ", "))
-	}
 	fmt.Printf("║                                                  \n")
-	fmt.Printf("║  Approve: POST /api/v1/checkpoints/%s/approve\n", cp.ID[:8])
-	fmt.Printf("║  Deny:    POST /api/v1/checkpoints/%s/deny\n", cp.ID[:8])
+	fmt.Printf("║  Approve: crush-orchestrator checkpoint approve %s\n", cp.ID[:8])
+	fmt.Printf("║  Deny:    crush-orchestrator checkpoint deny %s [reason]\n", cp.ID[:8])
 	fmt.Printf("╚══════════════════════════════════════════════════╝\n")
 
 	c.JSON(http.StatusCreated, cp)
@@ -458,7 +583,6 @@ func (d *Daemon) listCheckpoints(c *gin.Context) {
 func (d *Daemon) approveCheckpoint(c *gin.Context) {
 	id := c.Param("id")
 
-	// Try to find full ID from prefix
 	fullID := d.findCheckpointID(id)
 	if fullID == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Checkpoint not found"})
@@ -467,15 +591,10 @@ func (d *Daemon) approveCheckpoint(c *gin.Context) {
 
 	cp, err := d.state.ResolveCheckpoint(fullID, true, "")
 	if err != nil {
-		if err.Error() == "checkpoint already resolved" {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Notify waiting agent
 	d.cpMu.Lock()
 	if ch, ok := d.cpHandlers[fullID]; ok {
 		ch <- CheckpointResult{Approved: true}
@@ -503,35 +622,28 @@ func (d *Daemon) denyCheckpoint(c *gin.Context) {
 
 	cp, err := d.state.ResolveCheckpoint(fullID, false, req.Reason)
 	if err != nil {
-		if err.Error() == "checkpoint already resolved" {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			return
-		}
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
 
-	// Notify waiting agent
 	d.cpMu.Lock()
 	if ch, ok := d.cpHandlers[fullID]; ok {
 		ch <- CheckpointResult{Approved: false, Reason: req.Reason}
 	}
 	d.cpMu.Unlock()
 
-	fmt.Printf("✗ Checkpoint denied: %s (reason: %s)\n", cp.Description, req.Reason)
+	fmt.Printf("✗ Checkpoint denied: %s\n", cp.Description)
 
 	c.JSON(http.StatusOK, cp)
 }
 
-// findCheckpointID finds full ID from a prefix
 func (d *Daemon) findCheckpointID(prefix string) string {
 	checkpoints, _ := d.state.ListCheckpoints()
 	for _, cp := range checkpoints {
-		if len(cp.ID) >= len(prefix) && cp.ID[:len(prefix)] == prefix {
+		if len(cp.ID) >= 8 && cp.ID[:8] == prefix {
 			return cp.ID
 		}
 	}
-	// Try exact match
 	return prefix
 }
 
@@ -561,15 +673,4 @@ func (d *Daemon) authMiddleware() gin.HandlerFunc {
 
 		c.Next()
 	}
-}
-
-func joinStrings(strs []string, sep string) string {
-	result := ""
-	for i, s := range strs {
-		if i > 0 {
-			result += sep
-		}
-		result += s
-	}
-	return result
 }

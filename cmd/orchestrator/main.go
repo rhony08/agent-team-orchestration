@@ -231,6 +231,12 @@ func startCmd() *cobra.Command {
 			}
 
 			d := daemon.New(stateManager, port, secret)
+
+			// Register instance ports with daemon
+			for _, repo := range config.Repos {
+				d.RegisterInstancePort(repo.Name, repo.Port)
+			}
+
 			if err := d.Start(); err != nil {
 				return err
 			}
