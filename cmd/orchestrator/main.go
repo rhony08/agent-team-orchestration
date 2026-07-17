@@ -402,6 +402,7 @@ func statusCmd() *cobra.Command {
 
 func sendCmd() *cobra.Command {
 	var projectName string
+	var model string
 
 	cmd := &cobra.Command{
 		Use:   "send [session] [message]",
@@ -410,7 +411,8 @@ func sendCmd() *cobra.Command {
 
 Example:
   crush-orchestrator send todo-api "implement JWT authentication"
-  crush-orchestrator send todo-db "create Prisma schema for users"`,
+  crush-orchestrator send todo-db "create Prisma schema for users"
+  crush-orchestrator send todo-api "fix bug" --model anthropic/claude-sonnet-4`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			sessionName := args[0]
@@ -425,11 +427,16 @@ Example:
 			secret, _ := os.ReadFile(filepath.Join(stateDir, "auth.key"))
 
 			url := fmt.Sprintf("http://localhost:%d/api/v1/send", config.Port)
-			body, _ := json.Marshal(map[string]string{
+
+			reqBody := map[string]string{
 				"session": sessionName,
 				"message": message,
-			})
+			}
+			if model != "" {
+				reqBody["model"] = model
+			}
 
+			body, _ := json.Marshal(reqBody)
 			req, _ := http.NewRequest("POST", url, strings.NewReader(string(body)))
 			req.Header.Set("Authorization", "Bearer "+string(secret))
 			req.Header.Set("Content-Type", "application/json")
@@ -456,6 +463,8 @@ Example:
 	}
 
 	cmd.Flags().StringVar(&projectName, "project", "", "Project name")
+	cmd.Flags().StringVar(&model, "model", "", "Override model (format: provider/model)")
+
 	return cmd
 }
 

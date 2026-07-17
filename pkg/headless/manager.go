@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -184,7 +185,7 @@ func (m *Manager) ListSessions() []*Session {
 }
 
 // SendPrompt sends a prompt to a session (non-blocking)
-func (m *Manager) SendPrompt(sessionName, prompt string) (string, error) {
+func (m *Manager) SendPrompt(sessionName, prompt string, model string) (string, error) {
 	m.mu.RLock()
 	session, ok := m.sessions[sessionName]
 	m.mu.RUnlock()
@@ -193,11 +194,24 @@ func (m *Manager) SendPrompt(sessionName, prompt string) (string, error) {
 		return "", fmt.Errorf("session not found: %s", sessionName)
 	}
 
-	resp, err := m.apiCall("POST", fmt.Sprintf("/session/%s/prompt_async", session.ID), map[string]interface{}{
+	body := map[string]interface{}{
 		"parts": []map[string]string{
 			{"type": "text", "text": prompt},
 		},
-	})
+	}
+
+	// Add model if specified (format: "provider/model")
+	if model != "" {
+		parts := strings.SplitN(model, "/", 2)
+		if len(parts) == 2 {
+			body["model"] = map[string]string{
+				"providerID": parts[0],
+				"modelID":    parts[1],
+			}
+		}
+	}
+
+	resp, err := m.apiCall("POST", fmt.Sprintf("/session/%s/prompt_async", session.ID), body)
 	if err != nil {
 		return "", fmt.Errorf("failed to send prompt: %w", err)
 	}

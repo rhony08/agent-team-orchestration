@@ -153,6 +153,7 @@ func (d *Daemon) sendToSession(c *gin.Context) {
 	var req struct {
 		Session string `json:"session" binding:"required"`
 		Message string `json:"message" binding:"required"`
+		Model   string `json:"model"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -160,7 +161,7 @@ func (d *Daemon) sendToSession(c *gin.Context) {
 		return
 	}
 
-	response, err := d.headless.SendPrompt(req.Session, req.Message)
+	response, err := d.headless.SendPrompt(req.Session, req.Message, req.Model)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
